@@ -37,14 +37,12 @@ import requests
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 
-MINING_SENDER = "THE BLOCKCHAIN"
-MINING_REWARD = 1
-MINING_DIFFICULTY = 2
+MINING_REWARD = 10
 
 
 class Blockchain:
 
-    def __init__(self):
+    def __init__(self, name="THE BLOCKCHAIN"):
 
         self.transactions = []
         self.chain = []
@@ -53,6 +51,8 @@ class Blockchain:
         self.node_id = str(uuid1()).replace('-', '')
         # Create genesis block
         self.create_block(0, '00')
+        self.MINING_SENDER = name
+        self.MINING_DIFFICULTY = 2
 
     def register_node(self, node_url):
         """
@@ -87,7 +87,7 @@ class Blockchain:
                                    'value': value})
 
         # Reward for mining a block
-        if sender_address == MINING_SENDER:
+        if sender_address == self.MINING_SENDER:
             self.transactions.append(transaction)
             return len(self.chain) + 1
         # Manages transactions from wallet to another wallet
@@ -113,6 +113,15 @@ class Blockchain:
         self.transactions = []
 
         self.chain.append(block)
+
+        # Update difficulty every 2016 block (should be in exactly 2 weeks' time)
+        last_block = self.chain[-1]
+        last_index = last_block['block_number']
+        if last_index % 2016 == 0:
+            time_diff = self.chain[last_index] - self.chain[last_index - 2016]
+            two_week = 2*7*24*60*60*1.0
+            self.MINING_DIFFICULTY = self.MINING_DIFFICULTY * (two_week / time_diff)
+
         return block
 
     def hash(self, block):
@@ -137,12 +146,13 @@ class Blockchain:
 
         return nonce
 
-    def valid_proof(self, transactions, last_hash, nonce, difficulty=MINING_DIFFICULTY):
+    def valid_proof(self, transactions, last_hash, nonce):
         """
         Check if a hash value satisfies the mining conditions. This function is used within the proof_of_work function.
         """
         guess = (str(transactions) + str(last_hash) + str(nonce)).encode()
         guess_hash = hashlib.sha256(guess).hexdigest()
+        difficulty = self.MINING_DIFFICULTY
         return guess_hash[:difficulty] == '0' * difficulty
 
     def valid_chain(self, chain):
@@ -169,7 +179,7 @@ class Blockchain:
             transactions = [OrderedDict((k, transaction[k]) for k in transaction_elements) for transaction in
                             transactions]
 
-            if not self.valid_proof(transactions, block['previous_hash'], block['nonce'], MINING_DIFFICULTY):
+            if not self.valid_proof(transactions, block['previous_hash'], block['nonce'], self.MINING_DIFFICULTY):
                 return False
 
             last_block = block
@@ -273,7 +283,7 @@ def mine():
     nonce = blockchain.proof_of_work()
 
     # We must receive a reward for finding the proof.
-    blockchain.submit_transaction(sender_address=MINING_SENDER, recipient_address=blockchain.node_id,
+    blockchain.submit_transaction(sender_address=blockchain.MINING_SENDER, recipient_address=blockchain.node_id,
                                   value=MINING_REWARD, signature="")
 
     # Forge the new Block by adding it to the chain
