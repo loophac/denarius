@@ -1,4 +1,4 @@
-# Blockchain Python tutorial
+# Blockchain in Python
 
 This work is based on [adilmoujahid/blockchain-python-tutorial](https://github.com/adilmoujahid/blockchain-python-tutorial).
 
