@@ -37,9 +37,6 @@ from flask_cors import CORS
 import pickle
 
 
-
-
-
 class Blockchain:
 
     def __init__(self, name="THE BLOCKCHAIN"):
@@ -76,12 +73,12 @@ class Blockchain:
         # Update difficulty
         last_block = self.chain[-1]
         last_index = last_block['block_number']
-        if last_index % 2016 == 0:
+        if last_index % 2016 == 0 and last_index != 0:
             time_diff = self.chain[last_index] - self.chain[last_index - 2016]
             two_week = 2 * 7 * 24 * 60 * 60 * 1.0
             self.MINING_DIFFICULTY *= (two_week / time_diff)
 
-        if last_index % (6 * 30 * 24 * 6) == 0:
+        if last_index % (6 * 30 * 24 * 6) == 0 and last_index != 0:
             self.MINING_REWARD *= 0.5
 
     def register_node(self, node_url):
@@ -120,9 +117,9 @@ class Blockchain:
                 if t['sender_address'] == address and t['recipient_address'] == address:
                     pass
                 elif t['recipient_address'] == address:
-                    balance += t['value']
+                    balance += float(t['value'])
                 elif t['sender_address'] == address:
-                    balance -= t['value']
+                    balance -= float(t['value'])
         return balance
 
     def verify_enough_balance(self, address, value):
@@ -136,16 +133,15 @@ class Blockchain:
         # return True
         balance = 0.0
         for i, c in reversed(list(enumerate(self.chain))):
-            for j, t in enumerate(c):
+            for j, t in enumerate(c['transactions']):
                 if t['sender_address'] == address and t['recipient_address'] == address:
                     pass
                 elif t['recipient_address'] == address:
-                    balance += t['value']
+                    balance += float(t['value'])
                 elif t['sender_address'] == address:
-                    balance -= t['value']
-            if balance >= value:
+                    balance -= float(t['value'])
+            if balance >= float(value):
                 return True
-
         return False
 
     def submit_transaction(self, sender_address, recipient_address, value, signature):
@@ -159,14 +155,14 @@ class Blockchain:
         # Reward for mining a block
         if sender_address == self.MINING_SENDER:
             self.transactions.append(transaction)
-            return len(self.chain) + 1
+            return len(self.chain)
         # Manages transactions from wallet to another wallet
         else:
             transaction_verification = self.verify_transaction_signature(sender_address, signature, transaction)
             enough_balance = self.verify_enough_balance(sender_address, value)
             if transaction_verification and enough_balance:
                 self.transactions.append(transaction)
-                return len(self.chain) + 1
+                return len(self.chain)
             else:
                 return False
 
@@ -174,7 +170,7 @@ class Blockchain:
         """
         Add a block of transactions to the blockchain
         """
-        block = {'block_number': len(self.chain) + 1,
+        block = {'block_number': len(self.chain),
                  'timestamp': time(),
                  'transactions': self.transactions,
                  'nonce': nonce,
