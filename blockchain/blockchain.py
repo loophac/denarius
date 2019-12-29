@@ -17,23 +17,18 @@ References      : [1] https://github.com/dvf/blockchain/blob/master/blockchain.p
                   [2] https://github.com/julienr/ipynb_playground/blob/master/bitcoin/dumbcoin/dumbcoin.ipynb
 '''
 
-from collections import OrderedDict
-
 import binascii
-
-import Crypto
-import Crypto.Random
-from Crypto.Hash import SHA
-from Crypto.PublicKey import RSA
-from Crypto.Signature import PKCS1_v1_5
-
 import hashlib
 import json
+from collections import OrderedDict
 from time import time
 from urllib.parse import urlparse
 from uuid import uuid1
 
 import requests
+from Crypto.Hash import SHA
+from Crypto.PublicKey import RSA
+from Crypto.Signature import PKCS1_v1_5
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 
@@ -48,11 +43,15 @@ class Blockchain:
         self.chain = []
         self.nodes = set()
         # Generate random number to be used as node_id
-        self.node_id = str(uuid1()).replace('-', '')
+        self.node_address = str(uuid1()).replace('-', '')
         # Create genesis block
         self.create_block(0, '00')
         self.MINING_SENDER = name
         self.MINING_DIFFICULTY = 2
+
+    def set_miner_info(self, name, address):
+        self.MINING_SENDER = name
+        self.node_address = address
 
     def register_node(self, node_url):
         """
@@ -78,6 +77,46 @@ class Blockchain:
         h = SHA.new(str(transaction).encode('utf8'))
         return verifier.verify(h, binascii.unhexlify(signature))
 
+    def get_balance(self, address):
+        """
+        Get the balance noted on the address
+        :param address: the address of the account
+        :return: balance (Float)
+        """
+        balance = 0.0
+        for i, c in reversed(list(enumerate(self.chain))):
+            for j, t in enumerate(c['transactions']):
+                if t['sender_address'] == address and t['recipient_address'] == address:
+                    pass
+                elif t['recipient_address'] == address:
+                    balance += t['value']
+                elif t['sender_address'] == address:
+                    balance -= t['value']
+        return balance
+
+    def verify_enough_balance(self, address, value):
+        """
+        Check that the sender has enough balance in his wallet.
+        Greedy search, in theory faster than get_balanece()
+        :param sender_address: address of the sender
+        :param value: value to be sent
+        :return: True if sender has enough balance else False
+        """
+        # return True
+        balance = 0.0
+        for i, c in reversed(list(enumerate(self.chain))):
+            for j, t in enumerate(c):
+                if t['sender_address'] == address and t['recipient_address'] == address:
+                    pass
+                elif t['recipient_address'] == address:
+                    balance += t['value']
+                elif t['sender_address'] == address:
+                    balance -= t['value']
+            if balance >= value:
+                return True
+
+        return False
+
     def submit_transaction(self, sender_address, recipient_address, value, signature):
         """
         Add a transaction to transactions array if the signature verified
@@ -93,7 +132,8 @@ class Blockchain:
         # Manages transactions from wallet to another wallet
         else:
             transaction_verification = self.verify_transaction_signature(sender_address, signature, transaction)
-            if transaction_verification:
+            enough_balance = self.verify_enough_balance(sender_address, value)
+            if transaction_verification and enough_balance:
                 self.transactions.append(transaction)
                 return len(self.chain) + 1
             else:
@@ -119,7 +159,7 @@ class Blockchain:
         last_index = last_block['block_number']
         if last_index % 2016 == 0:
             time_diff = self.chain[last_index] - self.chain[last_index - 2016]
-            two_week = 2*7*24*60*60*1.0
+            two_week = 2 * 7 * 24 * 60 * 60 * 1.0
             self.MINING_DIFFICULTY = self.MINING_DIFFICULTY * (two_week / time_diff)
 
         return block
@@ -283,7 +323,7 @@ def mine():
     nonce = blockchain.proof_of_work()
 
     # We must receive a reward for finding the proof.
-    blockchain.submit_transaction(sender_address=blockchain.MINING_SENDER, recipient_address=blockchain.node_id,
+    blockchain.submit_transaction(sender_address=blockchain.MINING_SENDER, recipient_address=blockchain.node_address,
                                   value=MINING_REWARD, signature="")
 
     # Forge the new Block by adding it to the chain
@@ -298,6 +338,24 @@ def mine():
         'previous_hash': block['previous_hash'],
     }
     return jsonify(response), 200
+
+
+@app.route('/miner/register', methods=['POST'])
+def register_miner():
+    values = request.form
+    address = values.get('address')
+    name = values.get('name')
+
+    if address is None or name is None:
+        return "Error: Please add valid address and name", 400
+
+    blockchain.set_miner_info(name, address)
+
+    response = {
+        'message': 'Miner information has been updated',
+        'miner': address,
+    }
+    return jsonify(response), 201
 
 
 @app.route('/nodes/register', methods=['POST'])
@@ -339,6 +397,15 @@ def consensus():
 def get_nodes():
     nodes = list(blockchain.nodes)
     response = {'nodes': nodes}
+    return jsonify(response), 200
+
+
+@app.route('/miner/get', methods=['GET'])
+def get_miner_info():
+    response = {'name': blockchain.MINING_SENDER,
+                'address': blockchain.node_address,
+                'balance': blockchain.get_balance(blockchain.node_address)
+                }
     return jsonify(response), 200
 
 

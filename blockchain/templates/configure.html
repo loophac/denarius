@@ -42,7 +42,9 @@
     </nav>
 
 
-    <!-- Add nodes -->
+
+
+        <!-- Add nodes -->
     <div class="container">
       <div class="row">
         <div class="col-lg-12">
@@ -77,7 +79,71 @@
 
     <hr>
 
-    <!-- List of nodes -->
+        <!-- Add miner address -->
+    <div class="container">
+      <div class="row">
+        <div class="col-lg-12">
+
+          <div class="card-body">
+            <h4 class="card-title">Update Miner's Info</h4>
+            <p class="card-text">Enter the miner's public information and click on "Add" button to claim your reward!</p>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <div class="container alert alert-secondary">
+      <form id="info_form">
+
+        <div class="row">
+          <label class="col-sm-2">Miner's Name:</label>
+          <div class="col-sm-10">
+            <input type="text" name="address" id="address" rows="2" class="form-control">
+          </div>
+        </div>
+
+        <br>
+
+        <div class="row">
+          <label class="col-sm-2">Miner's Address:</label>
+          <div class="col-sm-10">
+            <input type="text" name="name" id="name" rows="5" class="form-control">
+          </div>
+        </div>
+
+        <br>
+
+        <div class="row">
+          <div class="col-lg-12 text-center">
+            <input type="button" id="update_info_button" class="btn btn-primary btn-lg" value="Update Info">
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <hr>
+
+
+
+        <!-- Miner's info -->
+    <div class="container">
+      <div class="row">
+
+        <div class="col-lg-12">
+          <div class="card-body">
+            <h4 class="card-title">Miner's info :</h4>
+          </div>
+        </div>
+
+        <div class="col-lg-12" id="miner_info">
+
+        </div>
+
+      </div>
+    </div>
+
+        <!-- List of nodes -->
     <div class="container">
       <div class="row">
 
@@ -93,6 +159,7 @@
 
       </div>
     </div>
+
 
     <!-- Bootstrap core JavaScript -->
     <script src="/static/vendor/jquery/jquery.min.js"></script>
@@ -126,6 +193,28 @@
 
           });
 
+          $("#update_info_button").click(function () {
+            //console.log($('#confirmation_transaction_form').serialize());
+
+            $.ajax({
+              url: "/miner/register",
+              type: "POST",
+              dataType : 'json',
+              data: $('#info_form').serialize(),
+              success: function(response){
+
+                console.log(response);
+                // document.getElementById("address").value = "";
+                window.location.reload();
+
+              },
+              error: function(error){
+                console.log(error);
+              }
+            });
+
+          });
+
 
         $.ajax({
           url: "/nodes/get",
@@ -148,12 +237,25 @@
           }
         });
 
+        $.ajax({
+          url: "/miner/get",
+          type: 'GET',
+          success: function(response){
+
+            console.log(response['miner']);
+
+            document.getElementById("miner_info").innerHTML = "Name: " + response['name'] + '<br>';
+            document.getElementById("miner_info").innerHTML += "Public Address: " + response['address'] + '<br>';
+            document.getElementById("miner_info").innerHTML += "Current Balance: " + response['balance'];
+
+
+          },
+          error: function(error){
+            console.log(error);
+          }
+        });
 
       })
-
-
-
-
 
     </script>
 

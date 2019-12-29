@@ -4,6 +4,9 @@
 
 Compared with the original one, we now support:
 
+
+- Set miner's information.
+- Balance check before every transaction.
 - Dynamic `difficulty` update every 2 weeks.
 - SSL support.
 
