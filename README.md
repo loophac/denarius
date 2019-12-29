@@ -3,11 +3,11 @@
 This work is based on [adilmoujahid/blockchain-python-tutorial](https://github.com/adilmoujahid/blockchain-python-tutorial).
 
 
-## Features
+## Novel Features
 
 Compared with the original one, we now introduce:
 
-- Constant wealth (1e8 coin in total).
+- Constant wealth (`1e8` coin in total).
 - Setting miner's information.
 - Balance check before every transaction.
 - Dynamic `difficulty` update every 2 weeks.
