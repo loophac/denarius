@@ -34,6 +34,8 @@ from Crypto.Signature import PKCS1_v1_5
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 
+import pickle
+
 
 
 
@@ -284,6 +286,18 @@ class Blockchain:
         return False
 
 
+    def save_everything(self):
+        with open('../states/blockchain.pkl', 'w+b') as f:
+            pickle.dump(self, f)
+
+
+    def load_everything(self, path):
+        try:
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        except FileNotFoundError:
+            return self
+
 # Instantiate the Node
 app = Flask(__name__)
 CORS(app)
@@ -353,6 +367,9 @@ def mine():
     # Forge the new Block by adding it to the chain
     previous_hash = blockchain.hash(last_block)
     block = blockchain.create_block(nonce, previous_hash)
+
+    # save this state
+    blockchain.save_everything()
 
     response = {
         'message': "New Block Forged",
@@ -438,8 +455,14 @@ if __name__ == '__main__':
 
     parser = ArgumentParser()
     parser.add_argument('-p', '--port', default=5000, type=int, help='port to listen on')
+    parser.add_argument('-r', '--resume', default=None, type=str, help='resume to a certain state')
     args = parser.parse_args()
     port = args.port
+    path = args.resume
+
+    # resume to the state
+    if path:
+        blockchain = blockchain.load_everything(path)
 
     # Run with SSL support
     app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))

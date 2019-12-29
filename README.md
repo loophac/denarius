@@ -13,6 +13,7 @@ Compared with the original one, we now introduce:
 - Transaction failure alert.
 - Dynamic `difficulty` update every 2 weeks.
 - SSL support.
+- Save running sates.
 
 
 
