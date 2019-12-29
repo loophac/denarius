@@ -1,3 +1,4 @@
+# Inside triple quote is left by the original author. Check out REAME for more info on the refined info.
 '''
 title           : blockchain.py
 description     : A blockchain implemenation
@@ -17,6 +18,7 @@ References      : [1] https://github.com/dvf/blockchain/blob/master/blockchain.p
                   [2] https://github.com/julienr/ipynb_playground/blob/master/bitcoin/dumbcoin/dumbcoin.ipynb
 '''
 
+
 import binascii
 import hashlib
 import json
@@ -32,7 +34,8 @@ from Crypto.Signature import PKCS1_v1_5
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 
-MINING_REWARD = 10
+
+
 
 
 class Blockchain:
@@ -48,10 +51,36 @@ class Blockchain:
         self.create_block(0, '00')
         self.MINING_SENDER = name
         self.MINING_DIFFICULTY = 2
+        self.TOTAL_AMOUNT = 100000000.0 # 1e8
+        self.MINING_REWARD = self.TOTAL_AMOUNT / 2 / (6 * 30 * 24 * 6)
 
     def set_miner_info(self, name, address):
+        """
+        Set miner's infomation
+        :param name: Miner's name.
+        :param address: Miner's public key address.
+        :return: None
+        """
         self.MINING_SENDER = name
         self.node_address = address
+
+    def update_hyperparameters(self):
+        """
+        Generate Block every 2 minutes.
+        Update difficulty every 2016 block (should be in exactly 2 weeks' time)
+        Update mining reward every six months.
+        :return:
+        """
+        # Update difficulty
+        last_block = self.chain[-1]
+        last_index = last_block['block_number']
+        if last_index % 2016 == 0:
+            time_diff = self.chain[last_index] - self.chain[last_index - 2016]
+            two_week = 2 * 7 * 24 * 60 * 60 * 1.0
+            self.MINING_DIFFICULTY *= (two_week / time_diff)
+
+        if last_index % (6 * 30 * 24 * 6) == 0:
+            self.MINING_REWARD *= 0.5
 
     def register_node(self, node_url):
         """
@@ -154,13 +183,8 @@ class Blockchain:
 
         self.chain.append(block)
 
-        # Update difficulty every 2016 block (should be in exactly 2 weeks' time)
-        last_block = self.chain[-1]
-        last_index = last_block['block_number']
-        if last_index % 2016 == 0:
-            time_diff = self.chain[last_index] - self.chain[last_index - 2016]
-            two_week = 2 * 7 * 24 * 60 * 60 * 1.0
-            self.MINING_DIFFICULTY = self.MINING_DIFFICULTY * (two_week / time_diff)
+        # Update hyperparameters.
+        self.update_hyperparameters()
 
         return block
 
@@ -324,7 +348,7 @@ def mine():
 
     # We must receive a reward for finding the proof.
     blockchain.submit_transaction(sender_address=blockchain.MINING_SENDER, recipient_address=blockchain.node_address,
-                                  value=MINING_REWARD, signature="")
+                                  value=blockchain.MINING_REWARD, signature="")
 
     # Forge the new Block by adding it to the chain
     previous_hash = blockchain.hash(last_block)

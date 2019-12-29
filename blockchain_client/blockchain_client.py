@@ -1,3 +1,4 @@
+# Inside triple quote is left by the original author. Check out REAME for more info on the refined info.
 '''
 title           : blockchain_client.py
 description     : A blockchain client implemenation, with the following features

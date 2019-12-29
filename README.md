@@ -1,11 +1,14 @@
 # Blockchain Python tutorial
 
+This work is based on [adilmoujahid/blockchain-python-tutorial](https://github.com/adilmoujahid/blockchain-python-tutorial).
+
+
 ## Features
 
-Compared with the original one, we now support:
+Compared with the original one, we now introduce:
 
-
-- Set miner's information.
+- Constant wealth (1e8 coin in total).
+- Setting miner's information.
 - Balance check before every transaction.
 - Dynamic `difficulty` update every 2 weeks.
 - SSL support.
