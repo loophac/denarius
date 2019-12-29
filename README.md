@@ -10,6 +10,7 @@ Compared with the original one, we now introduce:
 - Constant wealth (`1e8` coin in total).
 - Setting miner's information.
 - Balance check before every transaction.
+- Transaction failure alert.
 - Dynamic `difficulty` update every 2 weeks.
 - SSL support.
 
