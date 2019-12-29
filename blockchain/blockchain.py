@@ -350,4 +350,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     port = args.port
 
+    # Run with SSL support
     app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
+
+    # Run without SSL support
+    # app.run(host='127.0.0.1', port=port)
