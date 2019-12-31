@@ -241,7 +241,7 @@ class Blockchain:
             transactions = [OrderedDict((k, transaction[k]) for k in transaction_elements) for transaction in
                             transactions]
 
-            if not self.valid_proof(transactions, block['previous_hash'], block['nonce'], self.MINING_DIFFICULTY):
+            if not self.valid_proof(transactions, block['previous_hash'], block['nonce']):
                 return False
 
             last_block = block
@@ -262,8 +262,8 @@ class Blockchain:
 
         # Grab and verify the chains from all the nodes in our network
         for node in neighbours:
-            print('http://' + node + '/chain')
-            response = requests.get('http://' + node + '/chain')
+            print('https://' + node + '/chain')
+            response = requests.get('https://' + node + '/chain', verify='../certificates/cert.pem')
 
             if response.status_code == 200:
                 length = response.json()['length']
