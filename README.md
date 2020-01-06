@@ -24,13 +24,15 @@ Compared with the original one, we now introduce:
 
 In order to run this code, you'll need:
 
-- python 3
+- Python 3
 - pycrypto
+- Flask
 
-To install the pycrypto:
+To install the pycrypto and Flask, run:
 
 ```
 pip instal pycrypto
+pip install -U Flask
 ```
 
 
