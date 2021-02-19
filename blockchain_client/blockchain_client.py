@@ -57,7 +57,7 @@ class Transaction:
 
 
 app = Flask(__name__)
-
+app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
 @app.route('/')
 def index():
@@ -110,9 +110,9 @@ if __name__ == '__main__':
     port = args.port
 
     # Run with SSL support
-    app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
+    #app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
 
     # Run without SSL support
-    # app.run(host='127.0.0.1', port=port)
+    app.run(host='127.0.0.1', port=port)
 
 

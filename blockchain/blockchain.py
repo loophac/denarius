@@ -51,7 +51,7 @@ class Blockchain:
         self.MINING_SENDER = name
         self.MINING_DIFFICULTY = 2
         self.TOTAL_AMOUNT = 100000000.0 # 1e8
-        self.MINING_REWARD = self.TOTAL_AMOUNT / 2 / (6 * 30 * 24 * 6)
+        self.MINING_REWARD = self.TOTAL_AMOUNT / 100 / (6 * 30 * 24 * 6)
 
     def set_miner_info(self, name, address):
         """
@@ -165,6 +165,7 @@ class Blockchain:
                 return len(self.chain)
             else:
                 return False
+                print('Ah Shit')
 
     def create_block(self, nonce, previous_hash):
         """
@@ -262,8 +263,8 @@ class Blockchain:
 
         # Grab and verify the chains from all the nodes in our network
         for node in neighbours:
-            print('https://' + node + '/chain')
-            response = requests.get('https://' + node + '/chain', verify='../certificates/cert.pem')
+            print('http://' + node + '/chain')
+            response = requests.get('http://' + node + '/chain', verify='../certificates/cert.pem')
 
             if response.status_code == 200:
                 length = response.json()['length']
@@ -296,6 +297,7 @@ class Blockchain:
 
 # Instantiate the Node
 app = Flask(__name__)
+app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 CORS(app)
 
 # Instantiate the Blockchain
@@ -461,7 +463,7 @@ if __name__ == '__main__':
         blockchain = blockchain.load_everything(path)
 
     # Run with SSL support
-    app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
+    #app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
 
     # Run without SSL support
-    # app.run(host='127.0.0.1', port=port)
+    app.run(host='127.0.0.1', port=port)
