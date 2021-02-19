@@ -1,4 +1,4 @@
-# Denarius Network
+# Blockchain in Python
 
 This work is based on [adilmoujahid/blockchain-python-tutorial](https://github.com/adilmoujahid/blockchain-python-tutorial).
 
@@ -7,7 +7,7 @@ This work is based on [adilmoujahid/blockchain-python-tutorial](https://github.c
 
 Compared with the original one, we now introduce:
 
-- Denarii (coin name).
+- PKC (coin name).
 - Constant wealth (`1e8` coin in total).
 - Setting miner's information.
 - Balance check before every transaction.
@@ -27,12 +27,12 @@ In order to run this code, you'll need:
 - Python 3
 - pycrypto
 - Flask
-- Requests
 
-To install run:
+To install the pycrypto and Flask, run:
 
 ```
-pip install -r requirements.txt
+pip instal pycrypto
+pip install -U Flask
 ```
 
 
