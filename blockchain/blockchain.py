@@ -461,7 +461,7 @@ if __name__ == '__main__':
         blockchain = blockchain.load_everything(path)
 
     # Run with SSL support
-    app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
+    #app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
 
     # Run without SSL support
-    # app.run(host='127.0.0.1', port=port)
+    app.run(host='127.0.0.1', port=port)
