@@ -3,7 +3,7 @@
 This work is based on :
 
 - [adilmoujahid/blockchain-python-tutorial](https://github.com/adilmoujahid/blockchain-python-tutorial)  
-- [asuith/blockchain-in-python] (https://github.com/asuith/blockchain-in-python).
+- [asuith/blockchain-in-python](https://github.com/asuith/blockchain-in-python)
 
 
 ## Novel Features from asuith/blockchain-in-python
