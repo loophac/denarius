@@ -69,6 +69,8 @@ def make_transaction():
     return render_template('./make_transaction.html')
 
 
+
+
 @app.route('/view/transactions')
 def view_transaction():
     return render_template('./view_transactions.html')
