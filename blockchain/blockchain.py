@@ -1,24 +1,3 @@
-# Inside triple quote is left by the original author. Check out REAME for more info on the refined info.
-'''
-title           : blockchain.py
-description     : A blockchain implemenation
-author          : Adil Moujahid
-date_created    : 20180212
-date_modified   : 20180309
-version         : 0.5
-usage           : python blockchain.py
-                  python blockchain.py -p 5000
-                  python blockchain.py --port 5000
-python_version  : 3.6.1
-Comments        : The blockchain implementation is mostly based on [1]. 
-                  I made a few modifications to the original code in order to add RSA encryption to the transactions 
-                  based on [2], changed the proof of work algorithm, and added some Flask routes to interact with the 
-                  blockchain from the dashboards
-References      : [1] https://github.com/dvf/blockchain/blob/master/blockchain.py
-                  [2] https://github.com/julienr/ipynb_playground/blob/master/bitcoin/dumbcoin/dumbcoin.ipynb
-'''
-
-
 import binascii
 import hashlib
 import json
@@ -31,14 +10,12 @@ import requests
 from Crypto.Hash import SHA
 from Crypto.PublicKey import RSA
 from Crypto.Signature import PKCS1_v1_5
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, request, render_template, redirect, session, url_for
 from flask_cors import CORS
 
 import pickle
 
-
 class Blockchain:
-
     def __init__(self, name="THE BLOCKCHAIN"):
 
         self.transactions = []
@@ -295,10 +272,24 @@ class Blockchain:
         except FileNotFoundError:
             return self
 
-# Instantiate the Node
+
+
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+app.secret_key = 'your_secret_key'  # Replace with a strong key
 CORS(app)
+
+blockchain = Blockchain()
+registered_user = None  # To keep track of the first registered user
+
+
+def login_required(func):
+    def wrapper(*args, **kwargs):
+        if 'user' not in session:
+            return redirect(url_for('login'))
+        return func(*args, **kwargs)
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 # Instantiate the Blockchain
 blockchain = Blockchain()
@@ -306,7 +297,9 @@ blockchain = Blockchain()
 
 @app.route('/')
 def index():
-    return render_template('./index.html')
+    if not registered_user:
+        return redirect(url_for('register'))
+    return render_template('index.html')
 
 
 @app.route('/configure')
@@ -446,6 +439,41 @@ def get_miner_info():
                 'balance': blockchain.get_balance(blockchain.node_address)
                 }
     return jsonify(response), 200
+
+
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    global registered_user
+    if registered_user:
+        return redirect(url_for('index'))
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        registered_user = {'username': username, 'password': password}
+        session['user'] = username
+        return redirect(url_for('index'))
+    return render_template('register.html')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if registered_user and username == registered_user['username'] and password == registered_user['password']:
+            session['user'] = username
+            return redirect(url_for('index'))
+        return 'Invalid credentials', 403
+    return render_template('login.html')
+
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    return redirect(url_for('login'))
+
 
 
 if __name__ == '__main__':
