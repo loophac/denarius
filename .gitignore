@@ -1,0 +1,6 @@
+.test_deps/
+.verify_deps/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+states/*.json

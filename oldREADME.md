@@ -7,7 +7,7 @@ This work is based on [adilmoujahid/blockchain-python-tutorial](https://github.c
 
 Compared with the original one, we now introduce:
 
-- PKC (coin name).
+- Denarii (coin name).
 - Constant wealth (`1e8` coin in total).
 - Setting miner's information.
 - Balance check before every transaction.
@@ -25,13 +25,13 @@ Compared with the original one, we now introduce:
 In order to run this code, you'll need:
 
 - Python 3
-- pycrypto
+- cryptography
 - Flask
 
-To install the pycrypto and Flask, run:
+To install cryptography and Flask, run:
 
 ```
-pip instal pycrypto
+pip install cryptography
 pip install -U Flask
 ```
 

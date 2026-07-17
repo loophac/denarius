@@ -2,8 +2,8 @@
 '''
 title           : blockchain_client.py
 description     : A blockchain client implemenation, with the following features
-                  - Wallets generation using Public/Private key encryption (based on RSA algorithm)
-                  - Generation of transactions with RSA encryption      
+                  - Wallet generation using Ed25519 keys
+                  - Generation of signed transactions
 author          : Adil Moujahid
 date_created    : 20180212
 date_modified   : 20180309
@@ -17,26 +17,42 @@ References      : [1] https://github.com/julienr/ipynb_playground/blob/master/bi
 '''
 
 from collections import OrderedDict
+from decimal import Decimal, InvalidOperation
 
 import binascii
+import hashlib
+import json
 
-import Crypto
-import Crypto.Random
-from Crypto.Hash import SHA
-from Crypto.PublicKey import RSA
-from Crypto.Signature import PKCS1_v1_5
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 import requests
 from flask import Flask, jsonify, request, render_template
 
 
 class Transaction:
+    ATOMIC_UNITS = 100000000
 
     def __init__(self, sender_address, sender_private_key, recipient_address, value):
         self.sender_address = sender_address
         self.sender_private_key = sender_private_key
         self.recipient_address = recipient_address
-        self.value = value
+        self.value = self.parse_amount(value)
+
+    def parse_amount(self, value):
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            raise ValueError('Invalid amount')
+
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError('Invalid amount')
+
+        atomic_amount = amount * self.ATOMIC_UNITS
+        if atomic_amount != atomic_amount.to_integral_value():
+            raise ValueError('Invalid amount')
+
+        return str(int(atomic_amount))
 
     def __getattr__(self, attr):
         return self.data[attr]
@@ -46,14 +62,21 @@ class Transaction:
                             'recipient_address': self.recipient_address,
                             'value': self.value})
 
+    def canonical_transaction_bytes(self):
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(',', ':')).encode('utf8')
+
     def sign_transaction(self):
         """
         Sign transaction with private key
         """
-        private_key = RSA.importKey(binascii.unhexlify(self.sender_private_key))
-        signer = PKCS1_v1_5.new(private_key)
-        h = SHA.new(str(self.to_dict()).encode('utf8'))
-        return binascii.hexlify(signer.sign(h)).decode('ascii')
+        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(binascii.unhexlify(self.sender_private_key))
+        return binascii.hexlify(private_key.sign(self.canonical_transaction_bytes())).decode('ascii')
+
+
+def address_from_public_key(public_key_bytes):
+    public_key_hex = binascii.hexlify(public_key_bytes).decode('ascii')
+    checksum = hashlib.sha256(('DENARIUS:' + public_key_hex).encode('ascii')).hexdigest()[:8]
+    return 'dn' + public_key_hex + checksum
 
 
 app = Flask(__name__)
@@ -76,12 +99,21 @@ def view_transaction():
 
 @app.route('/wallet/new', methods=['GET'])
 def new_wallet():
-    random_gen = Crypto.Random.new().read
-    private_key = RSA.generate(1024, random_gen)
-    public_key = private_key.publickey()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    private_key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_key_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
     response = {
-        'private_key': binascii.hexlify(private_key.exportKey(format='DER')).decode('ascii'),
-        'public_key': binascii.hexlify(public_key.exportKey(format='DER')).decode('ascii')
+        'private_key': binascii.hexlify(private_key_bytes).decode('ascii'),
+        'public_key': binascii.hexlify(public_key_bytes).decode('ascii'),
+        'address': address_from_public_key(public_key_bytes),
     }
 
     return jsonify(response), 200
@@ -89,12 +121,15 @@ def new_wallet():
 
 @app.route('/generate/transaction', methods=['POST'])
 def generate_transaction():
-    sender_address = request.form['sender_address']
-    sender_private_key = request.form['sender_private_key']
-    recipient_address = request.form['recipient_address']
-    value = request.form['amount']
+    try:
+        sender_address = request.form['sender_address']
+        sender_private_key = request.form['sender_private_key']
+        recipient_address = request.form['recipient_address']
+        value = request.form['amount']
 
-    transaction = Transaction(sender_address, sender_private_key, recipient_address, value)
+        transaction = Transaction(sender_address, sender_private_key, recipient_address, value)
+    except (KeyError, ValueError):
+        return jsonify({'message': 'Invalid transaction'}), 400
 
     response = {'transaction': transaction.to_dict(), 'signature': transaction.sign_transaction()}
 

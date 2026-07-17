@@ -98,6 +98,14 @@
 
       $(function(){
 
+        function formatDenarii(atomicValue) {
+          var atomic = BigInt(atomicValue);
+          var units = 100000000n;
+          var whole = atomic / units;
+          var fractional = (atomic % units).toString().padStart(8, "0").replace(/0+$/, "");
+          return fractional ? whole.toString() + "." + fractional : whole.toString();
+        }
+
         
         $('#view_transactions').click(function(){
 
@@ -111,7 +119,7 @@
               var transactions = [];
               count = 1;
 
-              for (i = 1; i < response.length; i++) { 
+              for (i = 1; i < response["chain"].length; i++) { 
                 for (j = 0; j < response["chain"][i]["transactions"].length; j++) {
 
                   //format date 
@@ -122,7 +130,7 @@
                   transaction = [count,
                                 response["chain"][i]["transactions"][j]["recipient_address"],
                                 response["chain"][i]["transactions"][j]["sender_address"],
-                                response["chain"][i]["transactions"][j]["value"],
+                                formatDenarii(response["chain"][i]["transactions"][j]["value"]),
                                 formattedDateTime,
                                 response["chain"][i]["block_number"]];
                   transactions.push(transaction);
