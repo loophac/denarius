@@ -1,3 +1,26 @@
 body {
 	padding-top: 54px;
 	}
+
+.wallet-section {
+	border-bottom: 1px solid #dee2e6;
+	}
+
+.wallet-address {
+	color: #212529;
+	font-family: SFMono-Regular, Consolas, "Liberation Mono", monospace;
+	font-size: 0.875rem;
+	letter-spacing: 0;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+	}
+
+.wallet-actions {
+	width: 1%;
+	}
+
+@media (max-width: 575.98px) {
+	.wallet-actions {
+		width: auto;
+		}
+	}

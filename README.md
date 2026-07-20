@@ -118,10 +118,12 @@ python blockchain/blockchain.py --migrate-json states/blockchain.json --database
 ```
 
 The wallet creates an Ed25519 key, encrypts it with scrypt and AES-256-GCM, and
-downloads a `.denwallet` file. Raw private keys are never returned to the web
-page. To send DEN, select the encrypted wallet file and enter its password; the
-local wallet process decrypts it in memory, reads the next account nonce from
-the selected node, and uses the plaintext key only for that signing request.
+saves the encrypted wallet document in the browser's local storage. Raw private
+keys are never returned to the web page or stored in the browser. To send DEN,
+select a saved sender wallet and enter its password; the local wallet process
+decrypts it in memory, reads the next account nonce from the selected node, and
+uses the plaintext key only for that signing request. `.denwallet` backup files
+can be exported and imported, but they are not required for routine payments.
 
 To run the tests:
 

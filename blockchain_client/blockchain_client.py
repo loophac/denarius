@@ -45,7 +45,7 @@ from denarius_crypto import (
     wallet_public_metadata,
 )
 
-MAX_WALLET_FILE_BYTES = 64 * 1024
+MAX_WALLET_DOCUMENT_BYTES = 64 * 1024
 
 
 class Transaction:
@@ -130,19 +130,23 @@ def view_transaction():
     return render_template('./view_transactions.html')
 
 
-def uploaded_wallet_document():
-    wallet_file = request.files.get('wallet_file')
-    if wallet_file is None:
-        raise ValueError('Encrypted wallet file is required')
-    wallet_bytes = wallet_file.read(MAX_WALLET_FILE_BYTES + 1)
-    if len(wallet_bytes) > MAX_WALLET_FILE_BYTES:
-        raise ValueError('Encrypted wallet file is too large')
+def submitted_wallet_document():
+    wallet_json = request.form.get('wallet_document')
+    if wallet_json is not None:
+        wallet_bytes = wallet_json.encode('utf8')
+    else:
+        wallet_file = request.files.get('wallet_file')
+        if wallet_file is None:
+            raise ValueError('Encrypted wallet data is required')
+        wallet_bytes = wallet_file.read(MAX_WALLET_DOCUMENT_BYTES + 1)
+    if len(wallet_bytes) > MAX_WALLET_DOCUMENT_BYTES:
+        raise ValueError('Encrypted wallet data is too large')
     try:
         document = json.loads(wallet_bytes.decode('utf8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError('Encrypted wallet file is invalid') from exc
+        raise ValueError('Encrypted wallet data is invalid') from exc
     if not isinstance(document, dict):
-        raise ValueError('Encrypted wallet file is invalid')
+        raise ValueError('Encrypted wallet data is invalid')
     return document
 
 
@@ -164,7 +168,7 @@ def new_wallet():
 @app.route('/wallet/inspect', methods=['POST'])
 def inspect_wallet():
     try:
-        metadata = wallet_public_metadata(uploaded_wallet_document())
+        metadata = wallet_public_metadata(submitted_wallet_document())
     except ValueError as exc:
         return jsonify({'message': str(exc)}), 400
     return jsonify(metadata), 200
@@ -174,7 +178,7 @@ def inspect_wallet():
 def generate_transaction():
     try:
         wallet_data = decrypt_wallet(
-            uploaded_wallet_document(),
+            submitted_wallet_document(),
             request.form.get('password', ''),
         )
         sender_address = wallet_data['address']
@@ -191,8 +195,10 @@ def generate_transaction():
             nonce,
         )
         signature, transaction_id = transaction.signed_data()
-    except (binascii.Error, KeyError, ValueError):
-        return jsonify({'message': 'Invalid transaction'}), 400
+    except KeyError:
+        return jsonify({'message': 'Transaction details are incomplete'}), 400
+    except (binascii.Error, ValueError) as exc:
+        return jsonify({'message': str(exc) or 'Invalid transaction'}), 400
 
     response = {
         'transaction': transaction.to_dict(),

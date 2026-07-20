@@ -39,6 +39,7 @@ def install_flask_stubs():
     flask_stub.jsonify = lambda *args, **kwargs: args[0] if args else kwargs
     flask_stub.request = types.SimpleNamespace(
         form={},
+        files={},
         headers={},
         method="GET",
         get_json=lambda silent=True: {},
@@ -807,11 +808,28 @@ def test_json_migration_rejects_incomplete_state():
 def test_wallet_ui_never_requests_or_displays_raw_private_keys():
     create_template = (ROOT / "blockchain_client" / "templates" / "index.html").read_text()
     send_template = (ROOT / "blockchain_client" / "templates" / "make_transaction.html").read_text()
+    store_source = (ROOT / "blockchain_client" / "static" / "js" / "wallet_store.js").read_text()
 
     assert "private_key" not in create_template
     assert "sender_private_key" not in send_template
-    assert 'name="wallet_file"' in send_template
-    assert "/wallet/inspect" in send_template
+    assert 'id="sender_wallet"' in send_template
+    assert 'name="wallet_file"' not in send_template
+    assert "wallet_document" in send_template
+    assert "localStorage" in store_source
+    assert "private_key" not in store_source
+
+
+def test_wallet_service_accepts_a_browser_stored_wallet_document():
+    wallet_document = denarius_crypto.generate_encrypted_wallet("browser wallet password")
+    original_form = denarius_client.request.form
+    original_files = denarius_client.request.files
+    try:
+        denarius_client.request.form = {"wallet_document": json.dumps(wallet_document)}
+        denarius_client.request.files = {}
+        assert denarius_client.submitted_wallet_document() == wallet_document
+    finally:
+        denarius_client.request.form = original_form
+        denarius_client.request.files = original_files
 
 
 def test_node_and_dashboard_are_separate_process_boundaries():

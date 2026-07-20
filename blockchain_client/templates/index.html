@@ -1,36 +1,23 @@
 <!DOCTYPE html>
 <html lang="en">
-
   <head>
-
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
-    <meta name="description" content="">
-    <meta name="author" content="">
-
-    <title>Denarius Network Client</title>
-
-    <!-- Bootstrap core CSS -->
+    <title>Denarius Wallet</title>
     <link href="/static/vendor/bootstrap/css/bootstrap.min.css" rel="stylesheet">
     <link href="/static/css/custom.css" rel="stylesheet">
-
   </head>
-
   <body>
-
-    <!-- Navigation -->
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top">
       <div class="container">
-        <a class="navbar-brand" href="#">Denarius Network Client</a>
+        <a class="navbar-brand" href="/">Denarius Wallet</a>
         <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarResponsive" aria-controls="navbarResponsive" aria-expanded="false" aria-label="Toggle navigation">
           <span class="navbar-toggler-icon"></span>
         </button>
         <div class="collapse navbar-collapse" id="navbarResponsive">
           <ul class="navbar-nav ml-auto">
             <li class="nav-item active">
-              <a class="nav-link" href="/">Wallet Generator
-                <span class="sr-only">(current)</span>
-              </a>
+              <a class="nav-link" href="/">Wallets <span class="sr-only">(current)</span></a>
             </li>
             <li class="nav-item">
               <a class="nav-link" href="/make/transaction">Make Transaction</a>
@@ -43,161 +30,190 @@
       </div>
     </nav>
 
+    <main class="container py-4">
+      <header class="mb-4">
+        <h1 class="h3">Wallets</h1>
+      </header>
 
-
-    <div class="container">
-      <div class="row">
-        <div class="col-lg-12 text-center">
-
-
-          <div class="card-body">
-            <h4 class="card-title">Create Encrypted Wallet</h4>
-            <p class="card-text">Protect a new Denarii wallet with a password.</p>
-          </div>
-
-        </div>
-      </div>
-    </div>
-
-    <br>
-
-    <div class="container alert alert-secondary">
-
-        <div class="row">
-          <label class="col-sm-2" for="wallet_password">Password:</label>
-          <div class="col-sm-10">
+      <section class="wallet-section pb-4">
+        <h2 class="h5 mb-3">Create Wallet</h2>
+        <div class="form-row align-items-end">
+          <div class="form-group col-md-5">
+            <label for="wallet_password">Password</label>
             <input type="password" id="wallet_password" class="form-control" minlength="10" autocomplete="new-password">
           </div>
-        </div>
-
-        <br>
-
-        <div class="row">
-          <label class="col-sm-2" for="wallet_password_confirm">Confirm Password:</label>
-          <div class="col-sm-10">
+          <div class="form-group col-md-5">
+            <label for="wallet_password_confirm">Confirm Password</label>
             <input type="password" id="wallet_password_confirm" class="form-control" minlength="10" autocomplete="new-password">
           </div>
+          <div class="form-group col-md-2">
+            <button type="button" id="generate_wallet" class="btn btn-primary btn-block">Create</button>
+          </div>
         </div>
+        <div id="wallet_error" class="alert alert-danger" role="alert" style="display:none"></div>
+        <div id="wallet_result" class="alert alert-success" role="status" style="display:none">
+          <strong>Wallet saved in this browser.</strong>
+          <div id="created_address" class="wallet-address mt-1"></div>
+        </div>
+      </section>
 
-        <br>
-
-        <div class="row">
-          <div class="col-sm-12 text-center">
-            <button type="button" id="generate_wallet" class="btn btn-primary btn-lg">Create Wallet</button>
+      <section class="pt-4">
+        <div class="d-flex flex-wrap align-items-center justify-content-between mb-3">
+          <h2 class="h5 mb-2 mb-sm-0">My Wallets</h2>
+          <div>
+            <button type="button" id="import_wallet" class="btn btn-outline-secondary btn-sm">Import Backup</button>
+            <input type="file" id="import_wallet_file" accept=".denwallet,application/json" hidden>
           </div>
         </div>
 
-        <div id="wallet_error" class="alert alert-danger mt-3" role="alert" style="display:none"></div>
-
-    </div>
-
-    <div class="container" id="wallet_result" style="display:none">
-
-        <div class="row">
-          <label class="col-sm-2">Address:</label>
-          <div class="col-sm-10">
-            <textarea id="address" rows="2" class="form-control" readonly></textarea>
-          </div>
+        <div id="wallet_empty" class="text-muted py-3">No wallets are saved in this browser.</div>
+        <div id="wallet_table_wrapper" class="table-responsive" style="display:none">
+          <table class="table table-sm table-bordered bg-white">
+            <thead class="thead-light">
+              <tr>
+                <th scope="col">Address</th>
+                <th scope="col" class="wallet-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="wallet_table_body"></tbody>
+          </table>
         </div>
 
-        <br>
-
-        <div class="row">
-          <label class="col-sm-2">Public Key:</label>
-          <div class="col-sm-10">
-            <textarea id="public_key" rows="3" class="form-control" readonly></textarea>
-          </div>
+        <div class="alert alert-warning mt-3" role="alert">
+          Encrypted wallets are stored only in this browser. Export a backup before clearing browser data.
         </div>
+      </section>
+    </main>
 
-        <br>
-        
-        <div class="row">
-          <div class="col-sm-12 text-center">
-            <button type="button" id="download_wallet" class="btn btn-success btn-lg">Download Wallet</button>
-          </div>
-        </div>
-
-        <br>
-
-        <div class="row" id="warning">
-          <div class="col-sm-12">
-            <div class="alert alert-warning" role="alert">
-              IMPORTANT
-              <ul>
-                <li>Keep the downloaded wallet file and password in separate safe locations.</li>
-                <li>Neither can be recovered if lost.</li>
-              </ul> 
-            </div>
-          </div>
-        </div>
-
-    </div>
-
-
-
-
-
-    <!-- Bootstrap core JavaScript -->
     <script src="/static/vendor/jquery/jquery.min.js"></script>
     <script src="/static/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
-
-
+    <script src="/static/js/wallet_store.js"></script>
     <script>
+      function showWalletError(message) {
+        var errorBox = document.getElementById("wallet_error");
+        errorBox.textContent = message;
+        errorBox.style.display = "block";
+      }
 
-      var walletDocument = null;
-      var walletFilename = "denarius-wallet.denwallet";
+      function walletFilename(address) {
+        return "denarius-" + address.slice(0, 14) + ".denwallet";
+      }
 
-      $(function(){
-        $('#generate_wallet').click(function(){
+      function renderWallets() {
+        var wallets = DenariusWalletStore.list();
+        var tableBody = document.getElementById("wallet_table_body");
+        tableBody.textContent = "";
+        document.getElementById("wallet_empty").style.display = wallets.length ? "none" : "block";
+        document.getElementById("wallet_table_wrapper").style.display = wallets.length ? "block" : "none";
+
+        wallets.forEach(function (wallet) {
+          var row = document.createElement("tr");
+          var addressCell = document.createElement("td");
+          var address = document.createElement("code");
+          address.className = "wallet-address";
+          address.textContent = wallet.address;
+          addressCell.appendChild(address);
+
+          var actions = document.createElement("td");
+          actions.className = "wallet-actions text-nowrap";
+          var exportButton = document.createElement("button");
+          exportButton.type = "button";
+          exportButton.className = "btn btn-outline-primary btn-sm mr-2";
+          exportButton.textContent = "Export";
+          exportButton.addEventListener("click", function () {
+            DenariusWalletStore.exportWallet(wallet, walletFilename(wallet.address));
+          });
+          var removeButton = document.createElement("button");
+          removeButton.type = "button";
+          removeButton.className = "btn btn-outline-danger btn-sm";
+          removeButton.textContent = "Remove";
+          removeButton.addEventListener("click", function () {
+            if (window.confirm("Remove this wallet from this browser?")) {
+              DenariusWalletStore.remove(wallet.address);
+              renderWallets();
+            }
+          });
+          actions.appendChild(exportButton);
+          actions.appendChild(removeButton);
+          row.appendChild(addressCell);
+          row.appendChild(actions);
+          tableBody.appendChild(row);
+        });
+      }
+
+      $(function () {
+        renderWallets();
+
+        $("#generate_wallet").click(function () {
           var password = document.getElementById("wallet_password").value;
           var confirmation = document.getElementById("wallet_password_confirm").value;
-          var errorBox = document.getElementById("wallet_error");
-          errorBox.style.display = "none";
+          document.getElementById("wallet_error").style.display = "none";
+          document.getElementById("wallet_result").style.display = "none";
           if (password.length < 10 || password !== confirmation) {
-            errorBox.textContent = "Passwords must match and contain at least 10 characters.";
-            errorBox.style.display = "block";
+            showWalletError("Passwords must match and contain at least 10 characters.");
             return;
           }
 
           $.ajax({
-            url: '/wallet/new',
-            type: 'POST',
+            url: "/wallet/new",
+            type: "POST",
             data: {password: password},
-            success: function(response){
-              walletDocument = response['wallet'];
-              walletFilename = response['filename'];
-              document.getElementById("public_key").value = response['public_key'];
-              document.getElementById("address").value = response['address'];
+            success: function (response) {
+              try {
+                DenariusWalletStore.save(response.wallet);
+              } catch (error) {
+                showWalletError("This browser could not save the wallet.");
+                return;
+              }
+              document.getElementById("created_address").textContent = response.address;
               document.getElementById("wallet_result").style.display = "block";
+              document.getElementById("wallet_password").value = "";
+              document.getElementById("wallet_password_confirm").value = "";
+              renderWallets();
             },
-            error: function(error){
-              console.log(error);
-              errorBox.textContent = error.responseJSON && error.responseJSON.message
+            error: function (error) {
+              showWalletError(error.responseJSON && error.responseJSON.message
                 ? error.responseJSON.message
-                : "Unable to create the encrypted wallet.";
-              errorBox.style.display = "block";
+                : "Unable to create the encrypted wallet.");
             }
           });
         });
 
-        $('#download_wallet').click(function(){
-          if (!walletDocument) {
+        $("#import_wallet").click(function () {
+          document.getElementById("import_wallet_file").click();
+        });
+
+        $("#import_wallet_file").change(function (event) {
+          var file = event.target.files[0];
+          if (!file) {
             return;
           }
-          var blob = new Blob([JSON.stringify(walletDocument, null, 2)], {type: "application/json"});
-          var link = document.createElement("a");
-          link.href = URL.createObjectURL(blob);
-          link.download = walletFilename;
-          link.click();
-          URL.revokeObjectURL(link.href);
+          var reader = new FileReader();
+          reader.onload = function () {
+            var walletJson = String(reader.result);
+            $.ajax({
+              url: "/wallet/inspect",
+              type: "POST",
+              data: {wallet_document: walletJson},
+              success: function () {
+                try {
+                  DenariusWalletStore.save(JSON.parse(walletJson));
+                  renderWallets();
+                } catch (error) {
+                  showWalletError("Unable to save that wallet backup.");
+                }
+              },
+              error: function (error) {
+                showWalletError(error.responseJSON && error.responseJSON.message
+                  ? error.responseJSON.message
+                  : "That wallet backup is invalid.");
+              }
+            });
+          };
+          reader.readAsText(file);
+          event.target.value = "";
         });
-      })
-
-
+      });
     </script>
-
-
-
   </body>
-
 </html>
