@@ -112,6 +112,13 @@ body {
   text-overflow: ellipsis;
 }
 
+.sidebar-role {
+  color: #8f9aa1;
+  font-size: 0.6875rem;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+}
+
 .sidebar-logout {
   color: #aeb7bd;
   font-size: 0.8125rem;
@@ -435,6 +442,13 @@ body {
 .auth-product {
   color: var(--console-muted);
   font-size: 0.75rem;
+}
+
+.auth-switch {
+  color: var(--console-muted);
+  font-size: 0.8125rem;
+  margin: 20px 0 0;
+  text-align: center;
 }
 
 .btn {

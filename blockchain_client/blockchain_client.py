@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 from decimal import Decimal, InvalidOperation
@@ -31,11 +32,16 @@ from denarius_crypto import (
     generate_encrypted_wallet,
     wallet_public_metadata,
 )
+from denarius_accounts import DenariusAccountStore
 
 MAX_WALLET_DOCUMENT_BYTES = 64 * 1024
 PASSWORD_ITERATIONS = 240000
+DUMMY_PASSWORD_HASH = ('00' * 16) + ':' + ('00' * 32)
 NODE_TIMEOUT = 5
 ADMIN_TOKEN_ENV = 'DENARIUS_ADMIN_TOKEN'
+SETUP_TOKEN_ENV = 'DENARIUS_SETUP_TOKEN'
+DEFAULT_ACCOUNT_DATABASE = PROJECT_ROOT / 'states' / 'console-accounts.db'
+USERNAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$')
 
 
 class Transaction:
@@ -107,8 +113,9 @@ app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.secret_key = os.environ.get('DENARIUS_SECRET_KEY') or secrets.token_hex(32)
-
-registered_user = None
+account_store = DenariusAccountStore(
+    os.environ.get('DENARIUS_ACCOUNT_DATABASE', DEFAULT_ACCOUNT_DATABASE)
+)
 
 
 def node_base_url():
@@ -144,13 +151,49 @@ def ensure_csrf_token():
     return session['csrf_token']
 
 
+def current_account():
+    return account_store.find_by_id(session.get('account_id'))
+
+
+def begin_account_session(account):
+    session.clear()
+    session['account_id'] = account['id']
+    ensure_csrf_token()
+
+
+def is_loopback_request():
+    return getattr(request, 'remote_addr', None) in ('127.0.0.1', '::1')
+
+
+def account_login_redirect():
+    session.clear()
+    endpoint = 'login' if account_store.has_admin() else 'register'
+    return redirect(url_for(endpoint))
+
+
 def login_required(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
-        if registered_user is None:
-            return redirect(url_for('register'))
-        if 'user' not in session:
-            return redirect(url_for('login'))
+        if current_account() is None:
+            return account_login_redirect()
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        account = current_account()
+        if account is None:
+            return account_login_redirect()
+        if account['role'] != 'admin':
+            if getattr(request, 'path', '').startswith('/api/'):
+                return jsonify({'message': 'Administrator access is required'}), 403
+            return render_template(
+                'forbidden.html',
+                csrf_token=ensure_csrf_token(),
+                username=account['username'],
+            ), 403
         return func(*args, **kwargs)
     return wrapper
 
@@ -202,16 +245,21 @@ def node_post(path, form=None, admin=False):
 
 
 def render_console(template_name, active_page):
+    account = current_account()
     return render_template(
         template_name,
         active_page=active_page,
         csrf_token=ensure_csrf_token(),
-        username=session.get('user'),
+        username=account['username'],
+        is_admin=account['role'] == 'admin',
+        wallet_scope=account['wallet_scope'],
     )
 
 @app.route('/')
 @login_required
 def index():
+    if current_account()['role'] != 'admin':
+        return redirect(url_for('wallets'))
     return render_console('overview.html', 'overview')
 
 
@@ -234,7 +282,7 @@ def activity():
 
 
 @app.route('/network')
-@login_required
+@admin_required
 def network():
     return render_console('network.html', 'network')
 
@@ -252,7 +300,7 @@ def legacy_view_transactions():
 
 
 @app.route('/configure')
-@login_required
+@admin_required
 def legacy_configure():
     return redirect(url_for('network'))
 
@@ -283,40 +331,40 @@ def api_submit_transaction():
 
 
 @app.route('/api/miner', methods=['GET'])
-@login_required
+@admin_required
 def api_miner():
     return node_get('/miner/get')
 
 
 @app.route('/api/miner', methods=['POST'])
-@login_required
+@admin_required
 @csrf_required
 def api_register_miner():
     return node_post('/miner/register', request.form, admin=True)
 
 
 @app.route('/api/nodes', methods=['GET'])
-@login_required
+@admin_required
 def api_nodes():
     return node_get('/nodes/get')
 
 
 @app.route('/api/nodes', methods=['POST'])
-@login_required
+@admin_required
 @csrf_required
 def api_register_nodes():
     return node_post('/nodes/register', request.form, admin=True)
 
 
 @app.route('/api/mine', methods=['POST'])
-@login_required
+@admin_required
 @csrf_required
 def api_mine():
     return node_post('/mine', admin=True)
 
 
 @app.route('/api/resolve', methods=['POST'])
-@login_required
+@admin_required
 @csrf_required
 def api_resolve():
     return node_post('/nodes/resolve', admin=True)
@@ -412,30 +460,62 @@ def generate_transaction():
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    global registered_user
-    if registered_user:
-        return redirect(url_for('login'))
+    if current_account() is not None:
+        return redirect(url_for('index'))
+    setup_mode = not account_store.has_admin()
+    setup_token = os.environ.get(SETUP_TOKEN_ENV, '') if setup_mode else ''
+    setup_available = not setup_mode or bool(setup_token) or is_loopback_request()
+    if not setup_available:
+        return render_template(
+            'register.html',
+            csrf_token=ensure_csrf_token(),
+            error=None,
+            setup_mode=True,
+            setup_token_required=False,
+            setup_unavailable=True,
+        ), 403
     error = None
     if request.method == 'POST':
         submitted_token = request.form.get('csrf_token')
         if not submitted_token or not hmac.compare_digest(ensure_csrf_token(), submitted_token):
             error = 'Your session expired. Please try again.'
+        elif setup_mode and setup_token and not hmac.compare_digest(
+            setup_token,
+            request.form.get('setup_token', ''),
+        ):
+            error = 'The administrator setup code is incorrect.'
         else:
             username = request.form.get('username', '').strip()
             password = request.form.get('password', '')
-            if not username or len(username) > 64 or len(password) < 10:
-                error = 'Enter a username and a password of at least 10 characters.'
+            password_confirm = request.form.get('password_confirm', '')
+            if not USERNAME_PATTERN.fullmatch(username) or not 10 <= len(password) <= 256:
+                error = 'Use 3-64 letters, numbers, dots, dashes, or underscores and a password of 10-256 characters.'
+            elif password != password_confirm:
+                error = 'The passwords do not match.'
             else:
-                registered_user = {'username': username, 'password_hash': hash_password(password)}
-                session.clear()
-                session['user'] = username
-                ensure_csrf_token()
-                return redirect(url_for('index'))
-    return render_template('register.html', csrf_token=ensure_csrf_token(), error=error), 400 if error else 200
+                try:
+                    account = account_store.create_account(username, hash_password(password))
+                except ValueError as exc:
+                    error = str(exc)
+                else:
+                    begin_account_session(account)
+                    return redirect(url_for('index'))
+    return render_template(
+        'register.html',
+        csrf_token=ensure_csrf_token(),
+        error=error,
+        setup_mode=setup_mode,
+        setup_token_required=bool(setup_token),
+        setup_unavailable=False,
+    ), 400 if error else 200
 
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    if not account_store.has_admin():
+        return redirect(url_for('register'))
+    if current_account() is not None:
+        return redirect(url_for('index'))
     error = None
     if request.method == 'POST':
         submitted_token = request.form.get('csrf_token')
@@ -444,14 +524,11 @@ def login():
         else:
             username = request.form.get('username', '')
             password = request.form.get('password', '')
-            if (
-                registered_user
-                and username == registered_user['username']
-                and verify_password(password, registered_user['password_hash'])
-            ):
-                session.clear()
-                session['user'] = username
-                ensure_csrf_token()
+            account = account_store.find_by_username(username) if USERNAME_PATTERN.fullmatch(username) else None
+            encoded_password = account['password_hash'] if account else DUMMY_PASSWORD_HASH
+            password_matches = len(password) <= 256 and verify_password(password, encoded_password)
+            if account and password_matches:
+                begin_account_session(account)
                 return redirect(url_for('index'))
             error = 'The username or password is incorrect.'
     return render_template('login.html', csrf_token=ensure_csrf_token(), error=error), 403 if error else 200
@@ -470,10 +547,17 @@ if __name__ == '__main__':
 
     parser = ArgumentParser()
     parser.add_argument('-p', '--port', default=8080, type=int, help='console port to listen on')
+    parser.add_argument('--host', default='127.0.0.1', help='interface to listen on')
+    parser.add_argument(
+        '--accounts-database',
+        default=str(DEFAULT_ACCOUNT_DATABASE),
+        help='SQLite database for console accounts',
+    )
     args = parser.parse_args()
     port = args.port
+    account_store = DenariusAccountStore(args.accounts_database)
 
     node_base_url()
-    app.run(host='127.0.0.1', port=port)
+    app.run(host=args.host, port=port)
 
 

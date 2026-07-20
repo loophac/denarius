@@ -1,7 +1,20 @@
 (function (global) {
   "use strict";
 
-  var STORAGE_KEY = "denarius.encryptedWallets.v1";
+  var LEGACY_STORAGE_KEY = "denarius.encryptedWallets.v1";
+  var scopeMeta = document.querySelector('meta[name="denarius-wallet-scope"]');
+  var migrationMeta = document.querySelector('meta[name="denarius-wallet-migrate-legacy"]');
+  var walletScope = scopeMeta ? scopeMeta.getAttribute("content") : "unscoped";
+  var STORAGE_KEY = "denarius.encryptedWallets.v2." + encodeURIComponent(walletScope);
+
+  if (
+    migrationMeta && migrationMeta.getAttribute("content") === "true" &&
+    !global.localStorage.getItem(STORAGE_KEY) &&
+    global.localStorage.getItem(LEGACY_STORAGE_KEY)
+  ) {
+    global.localStorage.setItem(STORAGE_KEY, global.localStorage.getItem(LEGACY_STORAGE_KEY));
+    global.localStorage.removeItem(LEGACY_STORAGE_KEY);
+  }
 
   function list() {
     try {

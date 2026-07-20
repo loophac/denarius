@@ -45,6 +45,8 @@ def install_flask_stubs():
         files={},
         headers={},
         method="GET",
+        path="",
+        remote_addr="127.0.0.1",
         get_json=lambda silent=True: {},
     )
     flask_stub.render_template = lambda *args, **kwargs: ""
@@ -92,6 +94,7 @@ Transaction = denarius_client.Transaction
 import denarius_protocol
 import denarius_crypto
 from denarius_storage import migrate_json_state
+from denarius_accounts import DenariusAccountStore
 
 
 def mine_block(blockchain):
@@ -489,6 +492,117 @@ def test_local_admin_passwords_are_salted_and_verified():
     assert first_hash != second_hash
     assert denarius_dashboard.verify_password(password, first_hash) is True
     assert denarius_dashboard.verify_password("wrong password", first_hash) is False
+
+
+def test_console_accounts_persist_with_first_account_as_administrator():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "accounts.db"
+        store = DenariusAccountStore(database_path)
+        administrator = store.create_account("NodeAdmin", "admin-password-hash")
+        member = store.create_account("alice", "member-password-hash")
+
+        assert administrator["role"] == "admin"
+        assert member["role"] == "user"
+        assert DenariusAccountStore(database_path).find_by_username("nodeadmin") == administrator
+        assert DenariusAccountStore(database_path).find_by_id(member["id"]) == member
+
+
+def test_console_account_names_are_case_insensitively_unique():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = DenariusAccountStore(Path(tmpdir) / "accounts.db")
+        store.create_account("Alice", "first-password-hash")
+
+        try:
+            store.create_account("alice", "second-password-hash")
+        except ValueError as exc:
+            assert "already registered" in str(exc)
+        else:
+            raise AssertionError("duplicate console account was created")
+
+
+def test_first_console_administrator_requires_the_launcher_setup_code():
+    original_store = denarius_client.account_store
+    original_form = denarius_client.request.form
+    original_method = denarius_client.request.method
+    original_session = dict(denarius_client.session)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"DENARIUS_SETUP_TOKEN": "one-time-setup-code"},
+            clear=False,
+        ):
+            store = DenariusAccountStore(Path(tmpdir) / "accounts.db")
+            denarius_client.account_store = store
+            denarius_client.session.clear()
+            csrf_token = denarius_client.ensure_csrf_token()
+            denarius_client.request.method = "POST"
+            registration = {
+                "csrf_token": csrf_token,
+                "setup_token": "incorrect-code",
+                "username": "nodeadmin",
+                "password": "administrator password",
+                "password_confirm": "administrator password",
+            }
+            denarius_client.request.form = registration
+
+            _, status = denarius_client.register()
+            assert status == 400
+            assert store.has_admin() is False
+
+            registration["setup_token"] = "one-time-setup-code"
+            assert denarius_client.register() == "index"
+            assert store.find_by_username("nodeadmin")["role"] == "admin"
+    finally:
+        denarius_client.account_store = original_store
+        denarius_client.request.form = original_form
+        denarius_client.request.method = original_method
+        denarius_client.session.clear()
+        denarius_client.session.update(original_session)
+
+
+def test_standard_console_accounts_cannot_access_node_administration():
+    original_store = denarius_client.account_store
+    original_path = denarius_client.request.path
+    original_session = dict(denarius_client.session)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = DenariusAccountStore(Path(tmpdir) / "accounts.db")
+            administrator = store.create_account("admin", "admin-password-hash")
+            member = store.create_account("member", "member-password-hash")
+            denarius_client.account_store = store
+            denarius_client.session.clear()
+            denarius_client.session["account_id"] = member["id"]
+
+            denarius_client.request.path = "/network"
+            _, page_status = denarius_client.network()
+
+            assert page_status == 403
+            assert denarius_client.wallets() == ""
+            assert denarius_client.send() == ""
+            assert denarius_client.activity() == ""
+            assert denarius_client.index() == "wallets"
+
+            restricted_apis = (
+                ("/api/miner", denarius_client.api_miner),
+                ("/api/miner", denarius_client.api_register_miner),
+                ("/api/nodes", denarius_client.api_nodes),
+                ("/api/nodes", denarius_client.api_register_nodes),
+                ("/api/mine", denarius_client.api_mine),
+                ("/api/resolve", denarius_client.api_resolve),
+            )
+            for path, endpoint in restricted_apis:
+                denarius_client.request.path = path
+                _, api_status = endpoint()
+                assert api_status == 403
+
+            denarius_client.session["account_id"] = administrator["id"]
+            denarius_client.request.path = "/network"
+            assert denarius_client.network() == ""
+    finally:
+        denarius_client.account_store = original_store
+        denarius_client.request.path = original_path
+        denarius_client.session.clear()
+        denarius_client.session.update(original_session)
 
 
 def test_node_mining_requires_admin_token():
@@ -990,6 +1104,7 @@ def test_json_migration_rejects_incomplete_state():
 def test_wallet_ui_never_requests_or_displays_raw_private_keys():
     create_template = (ROOT / "blockchain_client" / "templates" / "wallets.html").read_text()
     send_template = (ROOT / "blockchain_client" / "templates" / "send.html").read_text()
+    base_template = (ROOT / "blockchain_client" / "templates" / "base.html").read_text()
     store_source = (ROOT / "blockchain_client" / "static" / "js" / "wallet_store.js").read_text()
 
     assert "private_key" not in create_template
@@ -999,6 +1114,8 @@ def test_wallet_ui_never_requests_or_displays_raw_private_keys():
     assert "wallet_document" in send_template
     assert "localStorage" in store_source
     assert "private_key" not in store_source
+    assert "denarius-wallet-scope" in base_template
+    assert "encryptedWallets.v2." in store_source
 
 
 def test_wallet_service_accepts_a_browser_stored_wallet_document():
@@ -1025,6 +1142,8 @@ def test_node_and_console_are_separate_process_boundaries():
     assert "render_template" in console_source
     assert "node_dashboard/dashboard.py" not in launcher_source
     assert "blockchain_client/blockchain_client.py" in launcher_source
+    assert "--accounts-database" in launcher_source
+    assert "--console-host" in launcher_source
 
 
 def test_phase_three_uses_one_coherent_console_navigation():
@@ -1033,5 +1152,6 @@ def test_phase_three_uses_one_coherent_console_navigation():
 
     for destination in ("Overview", "Wallets", "Send", "Activity", "Network"):
         assert destination in base_template
+    assert "{% if is_admin %}" in base_template
     assert "--console-port" in launcher_source
     assert "--dashboard-port" not in launcher_source

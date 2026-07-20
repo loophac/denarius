@@ -91,8 +91,11 @@ the node and console processes, and starts:
 - Node API: `http://127.0.0.1:5000`
 - Denarius Console: `http://127.0.0.1:8080`
 
-The console combines node status, wallet management, sending, transaction
-activity, mining, and peer configuration behind one local login.
+On the first visit, enter the one-time setup code printed by the launcher and
+create the persistent node administrator. Later visitors can create standard
+accounts or sign in without that code. Administrators can use the full node
+console; standard accounts are limited to Wallets, Send, and Activity. Account
+credentials are salted and hashed in `states/console-accounts.db`.
 
 The node checks peers every 30 seconds by default. Set a different interval
 without changing consensus data:
@@ -110,13 +113,14 @@ The two services can also be run independently:
 ```bash
 export DENARIUS_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 python blockchain/blockchain.py --port 5000 --database states/denarius.db
-python blockchain_client/blockchain_client.py --port 8080
+python blockchain_client/blockchain_client.py --port 8080 --accounts-database states/console-accounts.db
 ```
 
 Use the same `DENARIUS_ADMIN_TOKEN` for the node and console when starting
-them independently. The browser never receives this token. The console keeps
-its local login and CSRF checks, then forwards authorized administration calls
-to the node. Set `DENARIUS_SECRET_KEY` for a stable console session key.
+them independently. The browser never receives this token. The console checks
+the signed-in account's persisted role and CSRF token, then forwards authorized
+administration calls to the node. Set `DENARIUS_SECRET_KEY` for a stable console
+session key.
 
 Phase 1 uses protocol version 2, account nonces, transaction IDs, Merkle roots,
 and deterministic proof-of-work targets. State files created by Phase 0 or
@@ -130,8 +134,8 @@ python blockchain/blockchain.py --migrate-json states/blockchain.json --database
 ```
 
 The wallet creates an Ed25519 key, encrypts it with scrypt and AES-256-GCM, and
-saves the encrypted wallet document in the browser's local storage. Raw private
-keys are never returned to the web page or stored in the browser. To send DEN,
+saves the encrypted wallet document in account-scoped browser local storage.
+Raw private keys are never returned to the web page or stored in the browser. To send DEN,
 select a saved sender wallet and enter its password; the local console process
 decrypts it in memory, reads the next account nonce from the selected node, and
 uses the plaintext key only for that signing request. `.denwallet` backup files
@@ -159,6 +163,11 @@ advertise its reachable address:
 python run_denarius.py --node-host 0.0.0.0 --advertise-address 192.168.1.25:5000
 ```
 
+The web console remains local by default. For testing user accounts on a
+trusted local network, complete administrator setup first, then add
+`--console-host 0.0.0.0` and connect to port `8080`. Do not use the Flask
+development server as a public internet service.
+
 To run the tests:
 
 ```bash
@@ -172,7 +181,8 @@ responses, Merkle commitments, deterministic targets, exact chainwork, SQLite
 state loading and migration, authenticated wallet encryption, process
 separation, Denarii display formatting, protocol compatibility, relay
 deduplication, peer health, background synchronization, and header-first chain
-resolution.
+resolution, persistent console accounts, role authorization, and account-scoped
+wallet storage.
 
 ## Security notes
 

@@ -4,6 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
     <meta name="csrf-token" content="{{ csrf_token }}">
+    <meta name="denarius-wallet-scope" content="{{ wallet_scope }}">
+    <meta name="denarius-wallet-migrate-legacy" content="{{ 'true' if is_admin else 'false' }}">
     <title>{% block title %}Denarius Console{% endblock %}</title>
     <link href="/static/vendor/bootstrap/css/bootstrap.min.css" rel="stylesheet">
     <link href="/static/css/custom.css" rel="stylesheet">
@@ -14,16 +16,17 @@
         <span class="brand-mark">D</span>
         <span>Denarius</span>
       </a>
-      <div class="console-label">Console</div>
+      <div class="console-label">{{ 'Administration' if is_admin else 'Wallet' }}</div>
       <nav class="console-nav" aria-label="Primary navigation">
-        <a class="console-nav-link {% if active_page == 'overview' %}active{% endif %}" href="/">Overview</a>
+        {% if is_admin %}<a class="console-nav-link {% if active_page == 'overview' %}active{% endif %}" href="/">Overview</a>{% endif %}
         <a class="console-nav-link {% if active_page == 'wallets' %}active{% endif %}" href="/wallets">Wallets</a>
         <a class="console-nav-link {% if active_page == 'send' %}active{% endif %}" href="/send">Send</a>
         <a class="console-nav-link {% if active_page == 'activity' %}active{% endif %}" href="/activity">Activity</a>
-        <a class="console-nav-link {% if active_page == 'network' %}active{% endif %}" href="/network">Network</a>
+        {% if is_admin %}<a class="console-nav-link {% if active_page == 'network' %}active{% endif %}" href="/network">Network</a>{% endif %}
       </nav>
       <div class="console-sidebar-footer">
         <div class="sidebar-user">{{ username }}</div>
+        <div class="sidebar-role">{{ 'Administrator' if is_admin else 'Account' }}</div>
         <form method="post" action="/logout">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit" class="btn btn-link sidebar-logout">Sign out</button>
@@ -38,11 +41,11 @@
       </button>
       <div class="collapse navbar-collapse" id="mobileNavigation">
         <nav class="mobile-links py-3">
-          <a class="nav-link {% if active_page == 'overview' %}active{% endif %}" href="/">Overview</a>
+          {% if is_admin %}<a class="nav-link {% if active_page == 'overview' %}active{% endif %}" href="/">Overview</a>{% endif %}
           <a class="nav-link {% if active_page == 'wallets' %}active{% endif %}" href="/wallets">Wallets</a>
           <a class="nav-link {% if active_page == 'send' %}active{% endif %}" href="/send">Send</a>
           <a class="nav-link {% if active_page == 'activity' %}active{% endif %}" href="/activity">Activity</a>
-          <a class="nav-link {% if active_page == 'network' %}active{% endif %}" href="/network">Network</a>
+          {% if is_admin %}<a class="nav-link {% if active_page == 'network' %}active{% endif %}" href="/network">Network</a>{% endif %}
           <form method="post" action="/logout" class="px-3 pt-2">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit" class="btn btn-outline-light btn-sm">Sign out</button>

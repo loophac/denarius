@@ -1,20 +1,33 @@
 {% extends "auth_base.html" %}
-{% block title %}Set up | Denarius Console{% endblock %}
+{% block title %}{{ 'Set up' if setup_mode else 'Create account' }} | Denarius Console{% endblock %}
 {% block content %}
-  <h1 class="h4 mt-4 mb-1">Set up console access</h1>
-  <p class="text-muted mb-4">Create the administrator for this local session.</p>
+  <h1 class="h4 mt-4 mb-1">{{ 'Set up this node' if setup_mode else 'Create an account' }}</h1>
+  <p class="text-muted mb-4">{{ 'Complete setup from the node machine before accepting accounts.' if setup_unavailable else ('Create the administrator credentials used to manage Denarius.' if setup_mode else 'Create credentials for wallets and transactions.') }}</p>
   {% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}
+  {% if not setup_unavailable %}
   <form method="post" action="/register">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% if setup_token_required %}
+    <div class="form-group">
+      <label for="setup_token">Setup Code</label>
+      <input type="password" id="setup_token" name="setup_token" class="form-control" maxlength="256" autocomplete="one-time-code" required autofocus>
+    </div>
+    {% endif %}
     <div class="form-group">
       <label for="username">Username</label>
-      <input type="text" id="username" name="username" class="form-control" maxlength="64" autocomplete="username" required autofocus>
+      <input type="text" id="username" name="username" class="form-control" maxlength="64" autocomplete="username" required {% if not setup_token_required %}autofocus{% endif %}>
     </div>
     <div class="form-group">
       <label for="password">Password</label>
-      <input type="password" id="password" name="password" class="form-control" minlength="10" autocomplete="new-password" required>
-      <small class="form-text text-muted">At least 10 characters</small>
+      <input type="password" id="password" name="password" class="form-control" minlength="10" maxlength="256" autocomplete="new-password" required>
+      <small class="form-text text-muted">10-256 characters</small>
     </div>
-    <button type="submit" class="btn btn-primary btn-block">Create access</button>
+    <div class="form-group">
+      <label for="password_confirm">Confirm Password</label>
+      <input type="password" id="password_confirm" name="password_confirm" class="form-control" minlength="10" maxlength="256" autocomplete="new-password" required>
+    </div>
+    <button type="submit" class="btn btn-primary btn-block">{{ 'Create administrator' if setup_mode else 'Create account' }}</button>
   </form>
+  {% if not setup_mode %}<p class="auth-switch">Already registered? <a href="/login">Sign in</a></p>{% endif %}
+  {% endif %}
 {% endblock %}
