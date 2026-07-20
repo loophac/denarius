@@ -23,7 +23,7 @@
     <div class="metric">
       <div class="metric-label">Peers</div>
       <div class="metric-value" id="peer_count">--</div>
-      <div class="metric-detail">Configured network connections</div>
+      <div class="metric-detail" id="peer_detail">Configured network connections</div>
     </div>
   </section>
 
@@ -143,7 +143,10 @@
     });
 
     $.getJSON("/api/nodes").done(function (response) {
+      var peers = response.peers || [];
+      var healthy = peers.filter(function (peer) { return peer.status === "healthy"; }).length;
       document.getElementById("peer_count").textContent = response.nodes.length.toLocaleString();
+      document.getElementById("peer_detail").textContent = healthy.toLocaleString() + " healthy connection" + (healthy === 1 ? "" : "s");
     });
   }
 

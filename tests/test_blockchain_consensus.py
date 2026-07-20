@@ -8,7 +8,9 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import sys
+import threading
 import types
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
 from cryptography.hazmat.primitives import serialization
@@ -38,6 +40,7 @@ def install_flask_stubs():
     flask_stub.Flask = Flask
     flask_stub.jsonify = lambda *args, **kwargs: args[0] if args else kwargs
     flask_stub.request = types.SimpleNamespace(
+        args={},
         form={},
         files={},
         headers={},
@@ -522,13 +525,28 @@ def test_node_urls_reject_paths_and_markup():
             raise AssertionError("unsafe node URL was accepted")
 
 
+def test_node_rejects_its_advertised_address_as_a_peer():
+    blockchain = Blockchain()
+    blockchain.advertised_node = "127.0.0.1:5000"
+
+    try:
+        blockchain.register_node("http://127.0.0.1:5000")
+    except ValueError as exc:
+        assert "current node" in str(exc)
+    else:
+        raise AssertionError("node registered itself as a peer")
+
+
 def test_submit_transaction_relays_to_known_peers():
     blockchain, sender_address, private_key = funded_blockchain()
     recipient_address, _ = wallet(blockchain)
     transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
-    blockchain.nodes.add("127.0.0.1:5001")
+    peer_node = "127.0.0.1:5001"
+    blockchain.nodes.add(peer_node)
+    blockchain.network.health.record_compatible(peer_node, blockchain.protocol_status())
 
     with patch.object(denarius_blockchain.requests, "post") as post:
+        post.return_value = Mock(status_code=201)
         result = submit_signed(blockchain, transaction, relay=True)
 
     assert result == len(blockchain.chain)
@@ -537,6 +555,58 @@ def test_submit_transaction_relays_to_known_peers():
     assert post.call_args.kwargs["data"]["nonce"] == transaction["nonce"]
     assert post.call_args.kwargs["data"]["transaction_id"] == transaction["transaction_id"]
     assert post.call_args.kwargs["timeout"] == blockchain.PEER_REQUEST_TIMEOUT
+    assert post.call_args.kwargs["headers"]["X-Denarius-Network"] == blockchain.NETWORK_ID
+
+
+def test_transaction_relay_skips_incompatible_peers():
+    blockchain, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(blockchain)
+    transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
+    peer_node = "127.0.0.1:5001"
+    blockchain.nodes.add(peer_node)
+    incompatible = blockchain.protocol_status()
+    incompatible["network"] = "another-network"
+    response = Mock(status_code=200)
+    response.json.return_value = incompatible
+
+    with patch.object(denarius_blockchain.requests, "get", return_value=response), patch.object(denarius_blockchain.requests, "post") as post:
+        assert submit_signed(blockchain, transaction, relay=True)
+
+    post.assert_not_called()
+    health = blockchain.peer_health()[0]
+    assert health["status"] == "incompatible"
+    assert health["compatible"] is False
+
+
+def test_received_transaction_is_relayed_once():
+    local, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(local)
+    transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
+    original_headers = denarius_blockchain.request.headers
+    original_form = denarius_blockchain.request.form
+    denarius_blockchain.request.headers = {
+        "X-Denarius-Protocol-Version": str(local.PROTOCOL_VERSION),
+        "X-Denarius-Network": local.NETWORK_ID,
+        "X-Denarius-Peer-API-Version": "1",
+    }
+    denarius_blockchain.request.form = {
+        "sender_address": transaction["sender_address"],
+        "recipient_address": transaction["recipient_address"],
+        "amount": transaction["amount_atomic"],
+        "nonce": transaction["nonce"],
+        "signature": signature,
+        "transaction_id": transaction["transaction_id"],
+    }
+    try:
+        with patch.object(denarius_blockchain, "blockchain", local), patch.object(local, "broadcast_transaction") as relay:
+            _, first_status = denarius_blockchain.receive_transaction()
+            _, duplicate_status = denarius_blockchain.receive_transaction()
+        assert first_status == 201
+        assert duplicate_status == 200
+        relay.assert_called_once()
+    finally:
+        denarius_blockchain.request.headers = original_headers
+        denarius_blockchain.request.form = original_form
 
 
 def test_accept_block_from_peer_appends_and_removes_pending_transaction():
@@ -589,24 +659,39 @@ def test_valid_chain_rejects_oversized_blocks():
 def test_exchange_peer_table_adds_peers_from_registered_nodes():
     blockchain = Blockchain()
     blockchain.nodes.add("127.0.0.1:5001")
-    response = Mock(status_code=200)
-    response.json.return_value = {"nodes": ["127.0.0.1:5002", "http://127.0.0.1:5003"]}
 
-    with patch.object(denarius_blockchain.requests, "get", return_value=response) as get:
+    def get_peer_data(url, timeout, headers):
+        response = Mock(status_code=200)
+        if url.endswith("/protocol"):
+            response.json.return_value = blockchain.protocol_status()
+        else:
+            response.json.return_value = {
+                "nodes": ["127.0.0.1:5002", "http://127.0.0.1:5003"]
+            }
+        return response
+
+    with patch.object(denarius_blockchain.requests, "get", side_effect=get_peer_data) as get:
         blockchain.exchange_peer_table()
 
     assert "127.0.0.1:5002" in blockchain.nodes
     assert "127.0.0.1:5003" in blockchain.nodes
-    get.assert_called_once()
+    assert get.call_count == 2
 
 
-def test_resolve_conflicts_ignores_malformed_peer_chain_response():
+def test_resolve_conflicts_ignores_malformed_peer_header_response():
     blockchain = Blockchain()
     blockchain.nodes.add("127.0.0.1:5001")
-    response = Mock(status_code=200)
-    response.json.return_value = {"not_chain": []}
 
-    with patch.object(denarius_blockchain.requests, "get", return_value=response):
+    def get_malformed_headers(url, timeout, headers):
+        response = Mock(status_code=200)
+        response.json.return_value = (
+            blockchain.protocol_status()
+            if url.endswith("/protocol")
+            else {"not_headers": []}
+        )
+        return response
+
+    with patch.object(denarius_blockchain.requests, "get", side_effect=get_malformed_headers):
         assert blockchain.resolve_conflicts() is False
 
 
@@ -622,15 +707,114 @@ def test_resolve_conflicts_prefers_greater_chainwork():
 
     local.nodes.add("peer")
 
-    def get_peer_chain(url, timeout):
+    requested_paths = []
+
+    def get_peer_chain(url, timeout, headers):
+        parsed = urlparse(url)
+        requested_paths.append(parsed.path)
         response = Mock(status_code=200)
-        response.json.return_value = {"chain": peer.chain}
+        if parsed.path == "/protocol":
+            response.json.return_value = peer.protocol_status()
+        elif parsed.path == "/headers":
+            query = parse_qs(parsed.query)
+            start = int(query["start"][0])
+            limit = int(query["limit"][0])
+            peer_headers = peer.headers_for_chain()
+            response.json.return_value = {
+                "protocol": peer.protocol_status(),
+                "length": len(peer_headers),
+                "headers": peer_headers[start:start + limit],
+            }
+        elif parsed.path == "/blocks":
+            query = parse_qs(parsed.query)
+            start = int(query["start"][0])
+            limit = int(query["limit"][0])
+            response.json.return_value = {
+                "protocol": peer.protocol_status(),
+                "length": len(peer.chain),
+                "blocks": peer.chain[start:start + limit],
+            }
+        else:
+            raise AssertionError("unexpected peer request: " + url)
         return response
 
-    with patch.object(denarius_blockchain.requests, "get", side_effect=get_peer_chain):
+    with patch.object(denarius_blockchain.requests, "get", side_effect=get_peer_chain), patch.object(local, "save_everything"):
         assert local.resolve_conflicts() is True
 
     assert local.chain == peer.chain
+    assert "/headers" in requested_paths
+    assert "/blocks" in requested_paths
+    assert "/chain" not in requested_paths
+
+
+def test_equal_peer_sync_only_probes_the_local_tip_header():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    mine_empty_block(blockchain)
+    local_headers = blockchain.headers_for_chain()
+    peer = "127.0.0.1:5001"
+
+    with patch.object(blockchain.network, "get_json") as get_json:
+        get_json.return_value = {
+            "protocol": blockchain.protocol_status(),
+            "length": len(local_headers),
+            "headers": [local_headers[-1]],
+        }
+        result = blockchain.fetch_peer_headers(peer, local_headers)
+
+    assert result == (local_headers, len(local_headers) - 1)
+    get_json.assert_called_once_with(
+        peer,
+        "/headers?start=" + str(len(local_headers) - 1) + "&limit=1",
+    )
+
+
+def test_header_validation_rejects_tampered_proof_metadata():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    mine_empty_block(blockchain)
+    headers = blockchain.headers_for_chain()
+    headers[1]["hash"] = "0" * 64
+
+    assert blockchain.valid_header_chain(headers) is False
+
+
+def test_peer_health_becomes_unreachable_after_repeated_failures():
+    blockchain = Blockchain()
+    peer_node = "127.0.0.1:5001"
+    blockchain.nodes.add(peer_node)
+
+    with patch.object(
+        denarius_blockchain.requests,
+        "get",
+        side_effect=denarius_blockchain.requests.RequestException("offline"),
+    ):
+        for _ in range(3):
+            assert blockchain.network.ensure_compatible(peer_node) is False
+
+    health = blockchain.peer_health()[0]
+    assert health["status"] == "unreachable"
+    assert health["consecutive_failures"] == 3
+
+
+def test_background_synchronization_runs_and_can_be_woken():
+    blockchain = Blockchain()
+    synchronized = threading.Event()
+
+    def mark_synchronized():
+        synchronized.set()
+        return False
+
+    with patch.object(blockchain, "synchronize_network", side_effect=mark_synchronized):
+        thread = blockchain.start_background_sync(interval=60)
+        assert synchronized.wait(1)
+        synchronized.clear()
+        blockchain.trigger_background_sync()
+        assert synchronized.wait(1)
+        blockchain.stop_background_sync()
+        thread.join(timeout=1)
+
+    assert thread.is_alive() is False
 
 
 def test_chainwork_uses_exact_target_formula():

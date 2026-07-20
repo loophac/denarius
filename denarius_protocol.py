@@ -7,6 +7,14 @@ PROTOCOL_VERSION = 2
 NETWORK_ID = 'denarius-mainnet-v2'
 COINBASE_SENDER = 'DENARIUS_COINBASE'
 
+# The peer API can evolve without changing consensus serialization.
+PEER_API_VERSION = 1
+PEER_CAPABILITIES = (
+    'blocks-v1',
+    'headers-v1',
+    'relay-v1',
+)
+
 ATOMIC_UNITS = 100_000_000
 MAX_SUPPLY_DEN = 100_000_000
 MAX_SUPPLY_ATOMIC = MAX_SUPPLY_DEN * ATOMIC_UNITS
@@ -184,3 +192,4 @@ GENESIS_BLOCK = {
     'target': target_to_hex(INITIAL_TARGET),
     'transactions': [],
 }
+GENESIS_HASH = block_hash(GENESIS_BLOCK)

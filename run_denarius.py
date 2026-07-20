@@ -18,6 +18,9 @@ def main():
     parser = argparse.ArgumentParser(description='Run the Denarius node and local console')
     parser.add_argument('--node-port', type=int, default=5000)
     parser.add_argument('--console-port', '--wallet-port', dest='console_port', type=int, default=8080)
+    parser.add_argument('--sync-interval', type=int, default=30)
+    parser.add_argument('--node-host', default='127.0.0.1')
+    parser.add_argument('--advertise-address', default=None)
     parser.add_argument(
         '--database',
         default=str(PROJECT_ROOT / 'states' / 'denarius.db'),
@@ -30,7 +33,14 @@ def main():
     environment['DENARIUS_NODE_URL'] = 'http://127.0.0.1:' + str(args.node_port)
 
     services = [
-        command('blockchain/blockchain.py', args.node_port, '--database', args.database),
+        command(
+            'blockchain/blockchain.py',
+            args.node_port,
+            '--database', args.database,
+            '--sync-interval', str(args.sync_interval),
+            '--host', args.node_host,
+            '--advertise-address', args.advertise_address or ('127.0.0.1:' + str(args.node_port)),
+        ),
         command('blockchain_client/blockchain_client.py', args.console_port),
     ]
     processes = [

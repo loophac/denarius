@@ -25,9 +25,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from denarius_protocol import (
     ATOMIC_UNITS,
     BLOCK_FIELDS,
+    BLOCK_HEADER_FIELDS,
     COINBASE_FIELDS,
     COINBASE_SENDER,
     GENESIS_BLOCK,
+    GENESIS_HASH,
     HALVING_INTERVAL,
     INITIAL_BLOCK_REWARD,
     INITIAL_TARGET,
@@ -36,11 +38,13 @@ from denarius_protocol import (
     MAX_TARGET,
     MEDIAN_TIME_BLOCKS,
     NETWORK_ID,
+    PEER_API_VERSION,
     PROTOCOL_VERSION,
     RETARGET_INTERVAL,
     RETARGET_TIMESPAN,
     SIGNED_TRANSACTION_FIELDS,
     block_hash,
+    block_header,
     block_reward,
     calculate_merkle_root,
     canonical_json_bytes,
@@ -52,6 +56,7 @@ from denarius_protocol import (
     work_for_target,
 )
 from denarius_crypto import address_from_public_key, public_key_from_address
+from denarius_network import PeerNetwork, protocol_identity
 from denarius_storage import DenariusStorage, migrate_json_state
 
 class Blockchain:
@@ -64,6 +69,9 @@ class Blockchain:
     COINBASE_SENDER = COINBASE_SENDER
     PEER_REQUEST_TIMEOUT = 3
     MAX_PEERS = 128
+    MAX_HEADERS_PER_REQUEST = 512
+    MAX_BLOCKS_PER_REQUEST = 32
+    MAX_SYNC_HEADERS = 100000
     MAX_PENDING_TRANSACTIONS = 1000
     MAX_TRANSACTIONS_PER_BLOCK = 1000
     GENESIS_BLOCK = GENESIS_BLOCK
@@ -72,9 +80,18 @@ class Blockchain:
     def __init__(self, name="THE BLOCKCHAIN"):
 
         self._lock = threading.RLock()
+        self._sync_lock = threading.Lock()
+        self._sync_stop = threading.Event()
+        self._sync_wakeup = threading.Event()
+        self._sync_thread = None
         self.transactions = []
         self.chain = []
         self.nodes = set()
+        self.advertised_node = None
+        self.network = PeerNetwork(
+            timeout=self.PEER_REQUEST_TIMEOUT,
+            requests_module=requests,
+        )
         # Generate random number to be used as node_id
         self.node_address = str(uuid1()).replace('-', '')
         # Create genesis block
@@ -191,7 +208,7 @@ class Blockchain:
         return hostname + (':' + str(port) if port is not None else '')
 
     def peer_url(self, node, path):
-        return 'http://' + node + path
+        return self.network.peer_url(node, path)
 
     def register_node(self, node_url):
         """
@@ -199,54 +216,84 @@ class Blockchain:
         """
         normalized_node = self.normalize_node(node_url)
         with self._lock:
+            if normalized_node == self.advertised_node:
+                raise ValueError('Cannot register the current node as a peer')
             if len(self.nodes) >= self.MAX_PEERS and normalized_node not in self.nodes:
                 raise ValueError('Peer limit reached')
             self.nodes.add(normalized_node)
 
     def exchange_peer_table(self):
-        for node in list(self.nodes):
-            try:
-                response = requests.get(
-                    self.peer_url(node, '/nodes/get'),
-                    timeout=self.PEER_REQUEST_TIMEOUT,
-                )
-                if response.status_code != 200:
-                    continue
-                for peer in response.json().get('nodes', []):
-                    if len(self.nodes) >= self.MAX_PEERS:
-                        return
-                    self.register_node(peer)
-            except (requests.RequestException, ValueError, KeyError):
+        with self._lock:
+            peers = list(self.nodes)
+            original_count = len(self.nodes)
+        for node in peers:
+            payload = self.network.get_json(node, '/nodes/get')
+            if payload is None:
                 continue
+            discovered = payload.get('nodes')
+            if not isinstance(discovered, list):
+                self.network.health.record_failure(node, 'Peer returned an invalid peer table')
+                continue
+            for peer in discovered:
+                try:
+                    self.register_node(peer)
+                except ValueError:
+                    continue
+                with self._lock:
+                    if len(self.nodes) >= self.MAX_PEERS:
+                        break
+        with self._lock:
+            return len(self.nodes) - original_count
 
     def broadcast_transaction(self, transaction):
-        for node in list(self.nodes):
-            try:
-                requests.post(
-                    self.peer_url(node, '/transactions/receive'),
-                    data={
-                        'sender_address': transaction['sender_address'],
-                        'recipient_address': transaction['recipient_address'],
-                        'amount': transaction['amount_atomic'],
-                        'nonce': transaction['nonce'],
-                        'signature': transaction['signature'],
-                        'transaction_id': transaction['transaction_id'],
-                    },
-                    timeout=self.PEER_REQUEST_TIMEOUT,
-                )
-            except requests.RequestException:
-                continue
+        self.network.seen_transactions.add(transaction.get('transaction_id'))
+        with self._lock:
+            peers = list(self.nodes)
+        self.network.relay_transaction(peers, transaction)
 
     def broadcast_block(self, block):
-        for node in list(self.nodes):
-            try:
-                requests.post(
-                    self.peer_url(node, '/blocks/receive'),
-                    json={'block': block},
-                    timeout=self.PEER_REQUEST_TIMEOUT,
-                )
-            except requests.RequestException:
-                continue
+        try:
+            block_id = self.hash(block)
+        except (KeyError, TypeError, ValueError):
+            return
+        self.network.seen_blocks.add(block_id)
+        with self._lock:
+            peers = list(self.nodes)
+        self.network.relay_block(peers, block)
+
+    def has_seen_transaction(self, transaction_id):
+        if self.network.seen_transactions.contains(transaction_id):
+            return True
+        with self._lock:
+            if any(tx.get('transaction_id') == transaction_id for tx in self.transactions):
+                return True
+            return transaction_id in self.confirmed_transaction_keys()
+
+    def has_seen_block(self, block_id):
+        if self.network.seen_blocks.contains(block_id):
+            return True
+        with self._lock:
+            return any(self.hash(block) == block_id for block in self.chain)
+
+    def peer_health(self):
+        with self._lock:
+            peers = list(self.nodes)
+        return self.network.peer_health(peers)
+
+    def protocol_status(self):
+        with self._lock:
+            chain = copy.deepcopy(self.chain)
+        status = protocol_identity()
+        status.update({
+            'node': self.advertised_node,
+            'height': len(chain) - 1,
+            'tip_hash': self.hash(chain[-1]),
+            'chainwork': str(sum(
+                work_for_target(target_from_hex(block['target']))
+                for block in chain[1:]
+            )),
+        })
+        return status
 
     def canonical_transaction_bytes(self, transaction):
         return canonical_json_bytes(transaction)
@@ -425,6 +472,7 @@ class Blockchain:
             self.transactions.append(signed_transaction)
             next_block_number = len(self.chain)
 
+        self.network.seen_transactions.add(expected_transaction_id)
         if relay:
             self.broadcast_transaction(signed_transaction)
         return next_block_number
@@ -721,6 +769,207 @@ class Blockchain:
             return 0
         return sum(work_for_target(target_from_hex(block['target'])) for block in chain[1:])
 
+    def headers_for_chain(self, chain=None):
+        blocks = self.chain if chain is None else chain
+        headers = []
+        for block in blocks:
+            header = dict(block_header(block))
+            header['hash'] = self.hash(block)
+            headers.append(header)
+        return headers
+
+    def valid_header_chain(self, headers):
+        if not isinstance(headers, list) or not headers or len(headers) > self.MAX_SYNC_HEADERS:
+            return False
+
+        expected_fields = set(BLOCK_HEADER_FIELDS) | {'hash'}
+        header_chain = []
+        for height, header in enumerate(headers):
+            if not isinstance(header, dict) or set(header) != expected_fields:
+                return False
+            if header.get('block_number') != height:
+                return False
+            if header.get('version') != self.PROTOCOL_VERSION or header.get('network') != self.NETWORK_ID:
+                return False
+            if not isinstance(header.get('timestamp'), int) or isinstance(header.get('timestamp'), bool):
+                return False
+            if not isinstance(header.get('nonce'), int) or isinstance(header.get('nonce'), bool):
+                return False
+            if header['nonce'] < 0:
+                return False
+            merkle_root = header.get('merkle_root')
+            if not isinstance(merkle_root, str) or len(merkle_root) != 64:
+                return False
+            try:
+                bytes.fromhex(merkle_root)
+            except ValueError:
+                return False
+            if merkle_root != merkle_root.lower():
+                return False
+
+            header_without_hash = {field: header[field] for field in BLOCK_HEADER_FIELDS}
+            calculated_hash = block_hash(header_without_hash)
+            if header.get('hash') != calculated_hash:
+                return False
+
+            if height == 0:
+                if header_without_hash != dict(block_header(self.GENESIS_BLOCK)):
+                    return False
+                if calculated_hash != GENESIS_HASH:
+                    return False
+                header_chain.append(header_without_hash)
+                continue
+
+            if header.get('previous_hash') != headers[height - 1]['hash']:
+                return False
+            if header['timestamp'] <= self.median_time_past(header_chain):
+                return False
+            if header['timestamp'] > int(time()) + MAX_FUTURE_BLOCK_SECONDS:
+                return False
+            try:
+                target = target_from_hex(header.get('target'))
+            except ValueError:
+                return False
+            if target != self.expected_target(header_chain, height):
+                return False
+            if int(calculated_hash, 16) > target:
+                return False
+            header_chain.append(header_without_hash)
+        return True
+
+    def header_chainwork(self, headers):
+        if not self.valid_header_chain(headers):
+            return 0
+        return sum(work_for_target(target_from_hex(header['target'])) for header in headers[1:])
+
+    def fetch_peer_header_batch(self, peer, start, limit, expected_length=None):
+        payload = self.network.get_json(
+            peer,
+            '/headers?start=' + str(start) + '&limit=' + str(limit),
+        )
+        if payload is None:
+            return None
+        batch = payload.get('headers')
+        response_length = payload.get('length')
+        if not isinstance(batch, list) or len(batch) > limit:
+            self.network.health.record_failure(peer, 'Peer returned an invalid header batch')
+            return None
+        if not isinstance(response_length, int) or isinstance(response_length, bool):
+            self.network.health.record_failure(peer, 'Peer returned an invalid chain length')
+            return None
+        if response_length < 1 or response_length > self.MAX_SYNC_HEADERS:
+            self.network.health.record_failure(peer, 'Peer chain exceeds synchronization limits')
+            return None
+        if start > response_length or start + len(batch) > response_length:
+            self.network.health.record_failure(peer, 'Peer returned headers outside its declared chain')
+            return None
+        if expected_length is not None and response_length != expected_length:
+            self.network.health.record_failure(peer, 'Peer chain changed during header synchronization')
+            return None
+        expected_fields = set(BLOCK_HEADER_FIELDS) | {'hash'}
+        for offset, header in enumerate(batch):
+            height = start + offset
+            if not isinstance(header, dict) or set(header) != expected_fields:
+                return None
+            if header.get('block_number') != height:
+                return None
+            try:
+                if block_hash(header) != header.get('hash'):
+                    return None
+                if height > 0 and int(header['hash'], 16) > target_from_hex(header.get('target')):
+                    return None
+            except (KeyError, TypeError, ValueError):
+                return None
+        return batch, response_length
+
+    def fetch_peer_headers(self, peer, local_headers=None):
+        local_headers = self.headers_for_chain() if local_headers is None else local_headers
+        probe_height = max(0, len(local_headers) - 1)
+        probe_result = self.fetch_peer_header_batch(peer, probe_height, 1)
+        if probe_result is None:
+            return None
+        probe_batch, declared_length = probe_result
+        if probe_height < declared_length and len(probe_batch) != 1:
+            self.network.health.record_failure(peer, 'Peer returned an incomplete tip header')
+            return None
+
+        common_height = -1
+        low = 0
+        high = min(len(local_headers), declared_length) - 1
+        located_headers = {}
+        if probe_batch:
+            located_headers[probe_height] = probe_batch[0]
+            if probe_batch[0]['hash'] == local_headers[probe_height]['hash']:
+                common_height = probe_height
+                low = high + 1
+        while low <= high:
+            middle = (low + high) // 2
+            peer_header = located_headers.get(middle)
+            if peer_header is None:
+                result = self.fetch_peer_header_batch(peer, middle, 1, declared_length)
+                if result is None or len(result[0]) != 1:
+                    return None
+                peer_header = result[0][0]
+                located_headers[middle] = peer_header
+            if peer_header['hash'] == local_headers[middle]['hash']:
+                common_height = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+
+        if common_height < 0:
+            self.network.health.record_incompatible(peer, 'Peer does not share the Denarius genesis block')
+            return None
+
+        headers = copy.deepcopy(local_headers[:common_height + 1])
+        while len(headers) < declared_length:
+            start = len(headers)
+            limit = min(self.MAX_HEADERS_PER_REQUEST, declared_length - start)
+            result = self.fetch_peer_header_batch(peer, start, limit, declared_length)
+            if result is None or len(result[0]) != limit:
+                self.network.health.record_failure(peer, 'Peer returned an incomplete header chain')
+                return None
+            headers.extend(result[0])
+
+        if len(headers) != declared_length or not self.valid_header_chain(headers):
+            self.network.health.record_failure(peer, 'Peer returned an invalid header chain')
+            return None
+        work = self.header_chainwork(headers)
+        self.network.health.update_tip(peer, len(headers) - 1, work)
+        return headers, common_height
+
+    def fetch_peer_blocks(self, peer, headers, start):
+        blocks = []
+        expected_count = len(headers) - start
+        while len(blocks) < expected_count:
+            batch_start = start + len(blocks)
+            batch_limit = min(self.MAX_BLOCKS_PER_REQUEST, expected_count - len(blocks))
+            payload = self.network.get_json(
+                peer,
+                '/blocks?start=' + str(batch_start) + '&limit=' + str(batch_limit),
+            )
+            if payload is None:
+                return None
+            batch = payload.get('blocks')
+            if not isinstance(batch, list) or len(batch) != batch_limit:
+                self.network.health.record_failure(peer, 'Peer returned an incomplete block batch')
+                return None
+            for offset, block in enumerate(batch):
+                height = batch_start + offset
+                if not isinstance(block, dict):
+                    return None
+                try:
+                    if self.hash(block) != headers[height]['hash']:
+                        return None
+                    if dict(block_header(block)) != {
+                        field: headers[height][field] for field in BLOCK_HEADER_FIELDS
+                    }:
+                        return None
+                except (KeyError, TypeError, ValueError):
+                    return None
+            blocks.extend(batch)
+        return blocks
+
     def remove_confirmed_transactions(self, block):
         confirmed_transactions = block.get('transactions', [])[1:]
         self.transactions = [transaction for transaction in self.transactions
@@ -744,6 +993,7 @@ class Blockchain:
             self.update_hyperparameters()
             self.save_everything()
 
+        self.network.seen_blocks.add(self.hash(block))
         if relay:
             self.broadcast_block(block)
         return True
@@ -755,60 +1005,126 @@ class Blockchain:
         """
         with self._lock:
             neighbours = list(self.nodes)
-            current_chain = copy.deepcopy(self.chain)
-        new_chain = None
+            local_chain = copy.deepcopy(self.chain)
+        local_headers = self.headers_for_chain(local_chain)
+        best_headers = None
+        best_peer = None
+        best_common_height = None
+        best_work = self.header_chainwork(local_headers)
 
-        # Prefer the valid chain with the greatest accumulated work.
-        max_work = self.chainwork(current_chain)
-
-        # Grab and verify the chains from all the nodes in our network
         for node in neighbours:
-            try:
-                response = requests.get(
-                    self.peer_url(node, '/chain'),
-                    timeout=self.PEER_REQUEST_TIMEOUT,
-                )
-            except requests.RequestException:
+            peer_headers = self.fetch_peer_headers(node, local_headers)
+            if peer_headers is None:
                 continue
+            headers, common_height = peer_headers
+            peer_work = self.header_chainwork(headers)
+            if peer_work > best_work:
+                best_work = peer_work
+                best_headers = headers
+                best_peer = node
+                best_common_height = common_height
 
-            if response.status_code == 200:
-                try:
-                    chain = response.json()['chain']
-                except (ValueError, KeyError, TypeError):
-                    continue
-                try:
-                    chain_work = self.chainwork(chain)
-                except (KeyError, TypeError, ValueError, OverflowError):
-                    continue
+        if best_headers is None:
+            return False
 
-                # Check if the peer chain contains more accumulated proof-of-work.
-                if chain_work > max_work:
-                    max_work = chain_work
-                    new_chain = chain
+        suffix = self.fetch_peer_blocks(best_peer, best_headers, best_common_height + 1)
+        if suffix is None:
+            return False
+        candidate_chain = local_chain[:best_common_height + 1] + suffix
+        if not self.valid_chain(candidate_chain):
+            self.network.health.record_failure(best_peer, 'Peer block data did not match its valid headers')
+            return False
 
-        # Replace our chain if we discovered a new, valid chain with more work.
-        if new_chain:
-            with self._lock:
-                if self.chainwork(new_chain) <= self.chainwork(self.chain):
-                    return False
-                pending_transactions = copy.deepcopy(self.transactions)
-                self.chain = copy.deepcopy(new_chain)
-                self.transactions = []
-                for transaction in pending_transactions:
-                    self.submit_transaction(
-                        transaction.get('sender_address'),
-                        transaction.get('recipient_address'),
-                        transaction.get('amount_atomic'),
-                        transaction.get('nonce'),
-                        transaction.get('signature'),
-                        transaction.get('transaction_id'),
-                        relay=False,
-                    )
-                self.MINING_TARGET = self.expected_target(self.chain, len(self.chain))
+        with self._lock:
+            if self.chainwork(candidate_chain) <= self.chainwork(self.chain):
+                return False
+            current_chain = copy.deepcopy(self.chain)
+            pending_transactions = copy.deepcopy(self.transactions)
+            current_hashes = [self.hash(block) for block in current_chain]
+            candidate_hashes = [self.hash(block) for block in candidate_chain]
+            shared_height = -1
+            for height in range(min(len(current_hashes), len(candidate_hashes))):
+                if current_hashes[height] != candidate_hashes[height]:
+                    break
+                shared_height = height
+
+            disconnected_transactions = []
+            for block in current_chain[shared_height + 1:]:
+                disconnected_transactions.extend(block.get('transactions', [])[1:])
+
+            self.chain = copy.deepcopy(candidate_chain)
+            self.transactions = []
+            for transaction in disconnected_transactions + pending_transactions:
+                self.submit_transaction(
+                    transaction.get('sender_address'),
+                    transaction.get('recipient_address'),
+                    transaction.get('amount_atomic'),
+                    transaction.get('nonce'),
+                    transaction.get('signature'),
+                    transaction.get('transaction_id'),
+                    relay=False,
+                )
+            self.MINING_TARGET = self.expected_target(self.chain, len(self.chain))
+            self.save_everything()
+
+        for block in candidate_chain:
+            self.network.seen_blocks.add(self.hash(block))
+        return True
+
+    def synchronize_network(self):
+        if not self._sync_lock.acquire(blocking=False):
+            return False
+        try:
+            added_peers = self.exchange_peer_table()
+            replaced = self.resolve_conflicts()
+            if added_peers and not replaced:
                 self.save_everything()
-            return True
+            self.last_sync_at = int(time())
+            self.last_sync_error = None
+            return replaced
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            self.last_sync_at = int(time())
+            self.last_sync_error = str(exc)
+            return False
+        finally:
+            self._sync_lock.release()
 
-        return False
+    def start_background_sync(self, interval=30):
+        interval = max(1, int(interval))
+        if self._sync_thread is not None and self._sync_thread.is_alive():
+            return self._sync_thread
+
+        self._sync_stop.clear()
+        self._sync_wakeup.clear()
+
+        def worker():
+            while not self._sync_stop.is_set():
+                self.synchronize_network()
+                self._sync_wakeup.wait(interval)
+                self._sync_wakeup.clear()
+
+        self._sync_thread = threading.Thread(
+            target=worker,
+            name='denarius-network-sync',
+            daemon=True,
+        )
+        self._sync_thread.start()
+        return self._sync_thread
+
+    def trigger_background_sync(self):
+        self._sync_wakeup.set()
+
+    def stop_background_sync(self):
+        self._sync_stop.set()
+        self._sync_wakeup.set()
+
+    def synchronization_status(self):
+        return {
+            'running': self._sync_thread is not None and self._sync_thread.is_alive(),
+            'in_progress': self._sync_lock.locked(),
+            'last_sync': getattr(self, 'last_sync_at', None),
+            'last_error': getattr(self, 'last_sync_error', None),
+        }
 
 
     def save_everything(self):
@@ -912,6 +1228,23 @@ def admin_required(func):
     return wrapper
 
 
+def compatible_peer_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        compatible = (
+            request.headers.get('X-Denarius-Protocol-Version') == str(PROTOCOL_VERSION)
+            and request.headers.get('X-Denarius-Network') == NETWORK_ID
+            and request.headers.get('X-Denarius-Peer-API-Version') == str(PEER_API_VERSION)
+        )
+        if not compatible:
+            return jsonify({
+                'message': 'Incompatible Denarius peer protocol',
+                'protocol': blockchain.protocol_status(),
+            }), 409
+        return func(*args, **kwargs)
+    return wrapper
+
+
 @app.route('/transactions/new', methods=['POST'])
 def new_transaction():
     values = request.form
@@ -948,6 +1281,7 @@ def get_transactions():
 
 
 @app.route('/transactions/receive', methods=['POST'])
+@compatible_peer_required
 def receive_transaction():
     values = request.form
 
@@ -958,13 +1292,18 @@ def receive_transaction():
     if not all(k in values for k in required):
         return 'Missing values', 400
 
+    if blockchain.has_seen_transaction(values['transaction_id']):
+        return jsonify({'message': 'Transaction already known'}), 200
+
     transaction_result = blockchain.submit_transaction(
         values['sender_address'], values['recipient_address'], values['amount'],
         values['nonce'], values['signature'], values['transaction_id'],
-        relay=False,
+        relay=True,
     )
 
     if transaction_result == False:
+        if blockchain.has_seen_transaction(values['transaction_id']):
+            return jsonify({'message': 'Transaction already known'}), 200
         response = {'message': 'Invalid Transaction!'}
         return jsonify(response), 406
 
@@ -1013,7 +1352,54 @@ def mine():
     return jsonify(response), 200
 
 
+@app.route('/protocol', methods=['GET'])
+def get_protocol():
+    return jsonify(blockchain.protocol_status()), 200
+
+
+@app.route('/headers', methods=['GET'])
+@compatible_peer_required
+def get_headers():
+    try:
+        start = int(request.args.get('start', 0))
+        limit = int(request.args.get('limit', blockchain.MAX_HEADERS_PER_REQUEST))
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid header range'}), 400
+    if start < 0 or limit < 1 or limit > blockchain.MAX_HEADERS_PER_REQUEST:
+        return jsonify({'message': 'Invalid header range'}), 400
+    with blockchain._lock:
+        chain = copy.deepcopy(blockchain.chain)
+    headers = blockchain.headers_for_chain(chain)
+    return jsonify({
+        'protocol': blockchain.protocol_status(),
+        'length': len(headers),
+        'start': start,
+        'headers': headers[start:start + limit],
+    }), 200
+
+
+@app.route('/blocks', methods=['GET'])
+@compatible_peer_required
+def get_blocks():
+    try:
+        start = int(request.args.get('start', 0))
+        limit = int(request.args.get('limit', blockchain.MAX_BLOCKS_PER_REQUEST))
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid block range'}), 400
+    if start < 0 or limit < 1 or limit > blockchain.MAX_BLOCKS_PER_REQUEST:
+        return jsonify({'message': 'Invalid block range'}), 400
+    with blockchain._lock:
+        chain = copy.deepcopy(blockchain.chain)
+    return jsonify({
+        'protocol': blockchain.protocol_status(),
+        'length': len(chain),
+        'start': start,
+        'blocks': chain[start:start + limit],
+    }), 200
+
+
 @app.route('/blocks/receive', methods=['POST'])
+@compatible_peer_required
 def receive_block():
     values = request.get_json(silent=True) or {}
     block = values.get('block')
@@ -1021,11 +1407,19 @@ def receive_block():
     if not isinstance(block, dict):
         return jsonify({'message': 'Invalid block'}), 400
 
+    try:
+        block_id = blockchain.hash(block)
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'message': 'Invalid block'}), 400
+
+    if blockchain.has_seen_block(block_id):
+        return jsonify({'message': 'Block already known'}), 200
+
     if blockchain.accept_block(block):
         return jsonify({'message': 'Block accepted'}), 201
 
-    blockchain.resolve_conflicts()
-    return jsonify({'message': 'Block rejected'}), 406
+    blockchain.trigger_background_sync()
+    return jsonify({'message': 'Block did not extend the local chain; synchronization queued'}), 409
 
 
 @app.route('/miner/register', methods=['POST'])
@@ -1070,8 +1464,8 @@ def register_nodes():
     except ValueError as exc:
         return jsonify({'message': str(exc)}), 400
 
-    blockchain.exchange_peer_table()
     blockchain.save_everything()
+    blockchain.trigger_background_sync()
 
     response = {
         'message': 'New nodes have been added',
@@ -1083,18 +1477,17 @@ def register_nodes():
 @app.route('/nodes/resolve', methods=['POST'])
 @admin_required
 def consensus():
-    replaced = blockchain.resolve_conflicts()
+    replaced = blockchain.synchronize_network()
 
     if replaced:
         response = {
             'message': 'Our chain was replaced',
-            'new_chain': blockchain.chain
         }
     else:
         response = {
             'message': 'Our chain is authoritative',
-            'chain': blockchain.chain
         }
+    response['synchronization'] = blockchain.synchronization_status()
     return jsonify(response), 200
 
 
@@ -1102,7 +1495,12 @@ def consensus():
 def get_nodes():
     with blockchain._lock:
         nodes = sorted(blockchain.nodes)
-    response = {'nodes': nodes}
+    response = {
+        'nodes': nodes,
+        'peers': blockchain.peer_health(),
+        'protocol': blockchain.protocol_status(),
+        'synchronization': blockchain.synchronization_status(),
+    }
     return jsonify(response), 200
 
 
@@ -1122,6 +1520,7 @@ if __name__ == '__main__':
 
     parser = ArgumentParser()
     parser.add_argument('-p', '--port', default=5000, type=int, help='port to listen on')
+    parser.add_argument('--host', default='127.0.0.1', help='interface to listen on')
     parser.add_argument(
         '-d', '--database',
         default=str(Blockchain.STATE_PATH),
@@ -1131,6 +1530,17 @@ if __name__ == '__main__':
         '--migrate-json',
         default=None,
         help='migrate a Phase 1 JSON state file into the selected database',
+    )
+    parser.add_argument(
+        '--sync-interval',
+        default=30,
+        type=int,
+        help='seconds between background peer synchronization passes',
+    )
+    parser.add_argument(
+        '--advertise-address',
+        default=None,
+        help='host and port shared with peers (defaults to 127.0.0.1 and --port)',
     )
     args = parser.parse_args()
     port = args.port
@@ -1147,4 +1557,17 @@ if __name__ == '__main__':
         except ValueError as exc:
             parser.error(str(exc))
 
-    app.run(host='127.0.0.1', port=port)
+    try:
+        blockchain.advertised_node = blockchain.normalize_node(
+            args.advertise_address or ('127.0.0.1:' + str(port))
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    with blockchain._lock:
+        blockchain.nodes.discard(blockchain.advertised_node)
+
+    blockchain.start_background_sync(args.sync_interval)
+    try:
+        app.run(host=args.host, port=port)
+    finally:
+        blockchain.stop_background_sync()

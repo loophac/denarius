@@ -47,9 +47,21 @@
     <aside>
       <section class="console-section">
         <div class="section-heading"><h2>Synchronization</h2></div>
-        <div class="surface quick-actions">
-          <button type="button" id="sync_network" class="btn btn-primary">Synchronize now</button>
-          <a href="/activity" class="btn btn-outline-secondary">View chain activity</a>
+        <div class="surface">
+          <dl class="miner-summary mb-4">
+            <div class="summary-item">
+              <dt>Background Sync</dt>
+              <dd id="background_sync_state">Checking</dd>
+            </div>
+            <div class="summary-item">
+              <dt>Last Pass</dt>
+              <dd id="last_sync_time">Not yet</dd>
+            </div>
+          </dl>
+          <div class="quick-actions">
+            <button type="button" id="sync_network" class="btn btn-primary">Synchronize now</button>
+            <a href="/activity" class="btn btn-outline-secondary">View chain activity</a>
+          </div>
         </div>
       </section>
     </aside>
@@ -78,7 +90,15 @@
     </div>
     <div class="surface flush table-responsive" id="peer_table_wrapper" style="display:none">
       <table class="table data-table">
-        <thead><tr><th>Node</th><th style="width:150px">Status</th></tr></thead>
+        <thead>
+          <tr>
+            <th>Node</th>
+            <th style="width:130px">Health</th>
+            <th style="width:90px">Height</th>
+            <th style="width:110px">Latency</th>
+            <th style="width:170px">Last Seen</th>
+          </tr>
+        </thead>
         <tbody id="peer_rows"></tbody>
       </table>
     </div>
@@ -133,26 +153,53 @@
     $.getJSON("/api/nodes").done(function (response) {
       var body = document.getElementById("peer_rows");
       body.textContent = "";
-      response.nodes.forEach(function (node) {
+      var peerHealth = response.peers || response.nodes.map(function (node) {
+        return {node: node, status: "unknown"};
+      });
+      peerHealth.forEach(function (peer) {
         var row = document.createElement("tr");
         var nodeCell = document.createElement("td");
         nodeCell.className = "hash-value";
-        nodeCell.textContent = node;
+        nodeCell.textContent = peer.node;
         var statusCell = document.createElement("td");
         var status = document.createElement("span");
-        status.className = "status-badge status-confirmed";
-        status.textContent = "Configured";
+        status.className = "status-badge status-peer-" + peer.status;
+        status.textContent = peer.status.charAt(0).toUpperCase() + peer.status.slice(1);
+        if (peer.last_error) {
+          status.title = peer.last_error;
+        }
         statusCell.appendChild(status);
         row.appendChild(nodeCell);
         row.appendChild(statusCell);
+        row.appendChild(activityValueCell(peer.height === null || peer.height === undefined ? "--" : String(peer.height)));
+        row.appendChild(activityValueCell(peer.latency_ms === null || peer.latency_ms === undefined ? "--" : peer.latency_ms + " ms"));
+        row.appendChild(activityValueCell(peer.last_seen ? DenariusConsole.formatDate(peer.last_seen) : "Never"));
         body.appendChild(row);
       });
-      document.getElementById("peer_total").textContent = response.nodes.length + " configured";
-      document.getElementById("peer_empty").style.display = response.nodes.length ? "none" : "block";
-      document.getElementById("peer_table_wrapper").style.display = response.nodes.length ? "block" : "none";
+      var healthy = peerHealth.filter(function (peer) { return peer.status === "healthy"; }).length;
+      document.getElementById("peer_total").textContent = healthy + " healthy / " + response.nodes.length + " configured";
+      document.getElementById("peer_empty").style.display = peerHealth.length ? "none" : "block";
+      document.getElementById("peer_table_wrapper").style.display = peerHealth.length ? "block" : "none";
+      renderSynchronization(response.synchronization || {});
     }).fail(function () {
       DenariusConsole.notice("Unable to load peers.", "danger");
     });
+  }
+
+  function activityValueCell(value) {
+    var cell = document.createElement("td");
+    cell.textContent = value;
+    return cell;
+  }
+
+  function renderSynchronization(sync) {
+    var state = sync.running ? (sync.in_progress ? "Synchronizing" : "Running") : "Stopped";
+    document.getElementById("background_sync_state").textContent = state;
+    document.getElementById("last_sync_time").textContent = sync.last_sync ? DenariusConsole.formatDate(sync.last_sync) : "Not yet";
+    if (sync.last_error) {
+      document.getElementById("background_sync_state").textContent = "Needs attention";
+      document.getElementById("background_sync_state").title = sync.last_error;
+    }
   }
 
   $(function () {

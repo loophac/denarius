@@ -353,6 +353,27 @@ body {
   color: #245f45;
 }
 
+.status-peer-healthy {
+  background: #dff2e8;
+  color: #245f45;
+}
+
+.status-peer-degraded {
+  background: #fff1d6;
+  color: #7d520f;
+}
+
+.status-peer-incompatible,
+.status-peer-unreachable {
+  background: #f7dede;
+  color: #843838;
+}
+
+.status-peer-unknown {
+  background: #e9edf0;
+  color: #56616a;
+}
+
 .miner-summary {
   display: grid;
   gap: 14px;
