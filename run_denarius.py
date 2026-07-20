@@ -15,10 +15,9 @@ def command(script, port, *extra):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run the Denarius node, dashboard, and wallet')
+    parser = argparse.ArgumentParser(description='Run the Denarius node and local console')
     parser.add_argument('--node-port', type=int, default=5000)
-    parser.add_argument('--dashboard-port', type=int, default=5001)
-    parser.add_argument('--wallet-port', type=int, default=8080)
+    parser.add_argument('--console-port', '--wallet-port', dest='console_port', type=int, default=8080)
     parser.add_argument(
         '--database',
         default=str(PROJECT_ROOT / 'states' / 'denarius.db'),
@@ -32,16 +31,14 @@ def main():
 
     services = [
         command('blockchain/blockchain.py', args.node_port, '--database', args.database),
-        command('node_dashboard/dashboard.py', args.dashboard_port),
-        command('blockchain_client/blockchain_client.py', args.wallet_port),
+        command('blockchain_client/blockchain_client.py', args.console_port),
     ]
     processes = [
         subprocess.Popen(service, cwd=str(PROJECT_ROOT), env=environment)
         for service in services
     ]
     print('Denarius node:      http://127.0.0.1:' + str(args.node_port))
-    print('Node dashboard:     http://127.0.0.1:' + str(args.dashboard_port))
-    print('Encrypted wallet:   http://127.0.0.1:' + str(args.wallet_port))
+    print('Denarius Console:   http://127.0.0.1:' + str(args.console_port))
 
     interrupted = False
     try:

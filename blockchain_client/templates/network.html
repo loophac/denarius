@@ -1,0 +1,204 @@
+{% extends "base.html" %}
+{% block title %}Network | Denarius Console{% endblock %}
+{% block page_title %}Network{% endblock %}
+{% block page_subtitle %}Miner identity, peers, and synchronization{% endblock %}
+
+{% block content %}
+  <div class="section-row">
+    <div>
+      <section class="console-section">
+        <div class="section-heading">
+          <div>
+            <h2>Miner Identity</h2>
+            <p>Rewards are paid to the selected local wallet</p>
+          </div>
+        </div>
+        <div class="surface">
+          <dl class="miner-summary mb-4">
+            <div class="summary-item">
+              <dt>Current Name</dt>
+              <dd id="current_miner_name">--</dd>
+            </div>
+            <div class="summary-item">
+              <dt>Current Address</dt>
+              <dd id="current_miner_address" class="wallet-address">--</dd>
+            </div>
+            <div class="summary-item">
+              <dt>Balance</dt>
+              <dd id="current_miner_balance">--</dd>
+            </div>
+          </dl>
+          <form id="miner_form">
+            <div class="form-group">
+              <label for="miner_name">Miner Name</label>
+              <input type="text" name="name" id="miner_name" class="form-control" maxlength="80" required>
+            </div>
+            <div class="form-group">
+              <label for="miner_address">Reward Wallet</label>
+              <select name="address" id="miner_address" class="form-control" required></select>
+              <small id="miner_wallet_empty" class="form-text text-danger" style="display:none">Create a wallet before configuring mining.</small>
+            </div>
+            <button type="button" id="save_miner" class="btn btn-primary">Save Miner</button>
+          </form>
+        </div>
+      </section>
+    </div>
+
+    <aside>
+      <section class="console-section">
+        <div class="section-heading"><h2>Synchronization</h2></div>
+        <div class="surface quick-actions">
+          <button type="button" id="sync_network" class="btn btn-primary">Synchronize now</button>
+          <a href="/activity" class="btn btn-outline-secondary">View chain activity</a>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <section class="console-section">
+    <div class="section-heading">
+      <div>
+        <h2>Peers</h2>
+        <p>Nodes used for relay and chain comparison</p>
+      </div>
+      <span class="status-badge status-confirmed" id="peer_total">0 configured</span>
+    </div>
+    <div class="surface mb-3">
+      <form id="peer_form">
+        <div class="form-row align-items-end">
+          <div class="form-group col-md-10">
+            <label for="peer_nodes">Node Addresses</label>
+            <input type="text" name="nodes" id="peer_nodes" class="form-control" placeholder="127.0.0.1:5002, 127.0.0.1:5003" required>
+          </div>
+          <div class="form-group col-md-2">
+            <button type="button" id="add_peers" class="btn btn-outline-primary btn-block">Add</button>
+          </div>
+        </div>
+      </form>
+    </div>
+    <div class="surface flush table-responsive" id="peer_table_wrapper" style="display:none">
+      <table class="table data-table">
+        <thead><tr><th>Node</th><th style="width:150px">Status</th></tr></thead>
+        <tbody id="peer_rows"></tbody>
+      </table>
+    </div>
+    <div id="peer_empty" class="surface empty-state">No peers are configured.</div>
+  </section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/wallet_store.js"></script>
+<script>
+  var currentMiner = null;
+
+  function populateMinerWallets(currentAddress) {
+    var wallets = DenariusWalletStore.list();
+    var select = document.getElementById("miner_address");
+    select.textContent = "";
+    wallets.forEach(function (wallet) {
+      var option = document.createElement("option");
+      option.value = wallet.address;
+      option.textContent = wallet.address;
+      select.appendChild(option);
+    });
+    if (currentAddress && !wallets.some(function (wallet) { return wallet.address === currentAddress; })) {
+      var currentOption = document.createElement("option");
+      currentOption.value = currentAddress;
+      currentOption.textContent = currentAddress + " (current)";
+      select.appendChild(currentOption);
+    }
+    if (currentAddress) {
+      select.value = currentAddress;
+    }
+    var hasWallet = wallets.length > 0;
+    document.getElementById("save_miner").disabled = !hasWallet;
+    document.getElementById("miner_wallet_empty").style.display = hasWallet ? "none" : "block";
+  }
+
+  function loadMiner() {
+    $.getJSON("/api/miner").done(function (response) {
+      currentMiner = response;
+      document.getElementById("current_miner_name").textContent = response.name;
+      document.getElementById("current_miner_address").textContent = response.address;
+      document.getElementById("current_miner_balance").textContent = response.balance + " DEN";
+      document.getElementById("miner_name").value = response.name;
+      populateMinerWallets(response.address);
+    }).fail(function () {
+      DenariusConsole.notice("Unable to load miner configuration.", "danger");
+      populateMinerWallets(null);
+    });
+  }
+
+  function loadPeers() {
+    $.getJSON("/api/nodes").done(function (response) {
+      var body = document.getElementById("peer_rows");
+      body.textContent = "";
+      response.nodes.forEach(function (node) {
+        var row = document.createElement("tr");
+        var nodeCell = document.createElement("td");
+        nodeCell.className = "hash-value";
+        nodeCell.textContent = node;
+        var statusCell = document.createElement("td");
+        var status = document.createElement("span");
+        status.className = "status-badge status-confirmed";
+        status.textContent = "Configured";
+        statusCell.appendChild(status);
+        row.appendChild(nodeCell);
+        row.appendChild(statusCell);
+        body.appendChild(row);
+      });
+      document.getElementById("peer_total").textContent = response.nodes.length + " configured";
+      document.getElementById("peer_empty").style.display = response.nodes.length ? "none" : "block";
+      document.getElementById("peer_table_wrapper").style.display = response.nodes.length ? "block" : "none";
+    }).fail(function () {
+      DenariusConsole.notice("Unable to load peers.", "danger");
+    });
+  }
+
+  $(function () {
+    loadMiner();
+    loadPeers();
+
+    $("#save_miner").click(function () {
+      var button = this;
+      button.disabled = true;
+      $.post("/api/miner", $("#miner_form").serialize()).done(function () {
+        DenariusConsole.notice("Miner configuration saved.", "success");
+        loadMiner();
+      }).fail(function (error) {
+        DenariusConsole.notice(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "Unable to save miner configuration.", "danger");
+      }).always(function () {
+        button.disabled = false;
+      });
+    });
+
+    $("#add_peers").click(function () {
+      var button = this;
+      button.disabled = true;
+      $.post("/api/nodes", $("#peer_form").serialize()).done(function () {
+        document.getElementById("peer_nodes").value = "";
+        DenariusConsole.notice("Peer list updated.", "success");
+        loadPeers();
+      }).fail(function (error) {
+        DenariusConsole.notice(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "Unable to add those peers.", "danger");
+      }).always(function () {
+        button.disabled = false;
+      });
+    });
+
+    $("#sync_network").click(function () {
+      var button = this;
+      button.disabled = true;
+      $.post("/api/resolve").done(function (response) {
+        DenariusConsole.notice(response.message || "Synchronization finished.", "success");
+        loadMiner();
+        loadPeers();
+      }).fail(function () {
+        DenariusConsole.notice("Unable to synchronize with peers.", "danger");
+      }).always(function () {
+        button.disabled = false;
+      });
+    });
+  });
+</script>
+{% endblock %}

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <title>{% block title %}Denarius Console{% endblock %}</title>
+    <link href="/static/vendor/bootstrap/css/bootstrap.min.css" rel="stylesheet">
+    <link href="/static/css/custom.css" rel="stylesheet">
+  </head>
+  <body class="auth-body">
+    <main class="auth-panel">
+      <header class="auth-header">
+        <span class="brand-mark">D</span>
+        <div>
+          <div class="auth-brand">Denarius</div>
+          <div class="auth-product">Local Console</div>
+        </div>
+      </header>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

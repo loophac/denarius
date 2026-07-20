@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}Activity | Denarius Console{% endblock %}
+{% block page_title %}Activity{% endblock %}
+{% block page_subtitle %}Pending and confirmed network transactions{% endblock %}
+
+{% block content %}
+  <section class="console-section">
+    <div class="section-heading">
+      <ul class="nav nav-tabs tabs-quiet" id="activity_tabs" role="tablist">
+        <li class="nav-item"><a class="nav-link active" id="pending_tab" data-toggle="tab" href="#pending_panel" role="tab">Pending <span id="pending_badge" class="badge badge-light">0</span></a></li>
+        <li class="nav-item"><a class="nav-link" id="confirmed_tab" data-toggle="tab" href="#confirmed_panel" role="tab">Confirmed <span id="confirmed_badge" class="badge badge-light">0</span></a></li>
+      </ul>
+      <div class="d-flex">
+        <input type="search" id="activity_search" class="form-control form-control-sm mr-2" placeholder="Search" aria-label="Search activity">
+        <button type="button" class="btn btn-outline-secondary btn-sm" id="refresh_activity">Refresh</button>
+      </div>
+    </div>
+
+    <div class="tab-content">
+      <div class="tab-pane fade show active" id="pending_panel" role="tabpanel" aria-labelledby="pending_tab">
+        <div class="surface flush table-responsive">
+          <table class="table data-table">
+            <thead><tr><th style="width:23%">From</th><th style="width:23%">To</th><th style="width:16%">Amount</th><th style="width:10%">Nonce</th><th>Transaction ID</th></tr></thead>
+            <tbody id="pending_rows"></tbody>
+          </table>
+          <div class="empty-state" id="pending_empty">No pending transactions.</div>
+        </div>
+      </div>
+      <div class="tab-pane fade" id="confirmed_panel" role="tabpanel" aria-labelledby="confirmed_tab">
+        <div class="surface flush table-responsive">
+          <table class="table data-table">
+            <thead><tr><th style="width:19%">From</th><th style="width:19%">To</th><th style="width:14%">Amount</th><th style="width:9%">Block</th><th style="width:18%">Time</th><th>Transaction ID</th></tr></thead>
+            <tbody id="confirmed_rows"></tbody>
+          </table>
+          <div class="empty-state" id="confirmed_empty">No confirmed transactions.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function activityCell(value, className) {
+    var cell = document.createElement("td");
+    cell.textContent = value;
+    if (className) {
+      cell.className = className;
+    }
+    return cell;
+  }
+
+  function renderPending(transactions) {
+    var body = document.getElementById("pending_rows");
+    body.textContent = "";
+    transactions.slice().reverse().forEach(function (transaction) {
+      var row = document.createElement("tr");
+      row.appendChild(activityCell(transaction.sender_address, "wallet-address"));
+      row.appendChild(activityCell(transaction.recipient_address, "wallet-address"));
+      row.appendChild(activityCell(DenariusConsole.formatDenarii(transaction.amount_atomic)));
+      row.appendChild(activityCell(String(transaction.nonce)));
+      row.appendChild(activityCell(transaction.transaction_id, "hash-value"));
+      row.dataset.search = row.innerText.toLowerCase();
+      body.appendChild(row);
+    });
+    document.getElementById("pending_badge").textContent = transactions.length;
+    document.getElementById("pending_empty").style.display = transactions.length ? "none" : "block";
+  }
+
+  function confirmedTransactions(chain) {
+    var transactions = [];
+    for (var i = chain.length - 1; i >= 1 && transactions.length < 250; i -= 1) {
+      var block = chain[i];
+      for (var j = block.transactions.length - 1; j >= 0 && transactions.length < 250; j -= 1) {
+        transactions.push({transaction: block.transactions[j], block: block});
+      }
+    }
+    return transactions;
+  }
+
+  function renderConfirmed(items) {
+    var body = document.getElementById("confirmed_rows");
+    body.textContent = "";
+    items.forEach(function (item) {
+      var transaction = item.transaction;
+      var row = document.createElement("tr");
+      row.appendChild(activityCell(transaction.sender_address === "DENARIUS_COINBASE" ? "Coinbase" : transaction.sender_address, transaction.sender_address === "DENARIUS_COINBASE" ? "" : "wallet-address"));
+      row.appendChild(activityCell(transaction.recipient_address, "wallet-address"));
+      row.appendChild(activityCell(DenariusConsole.formatDenarii(transaction.amount_atomic)));
+      row.appendChild(activityCell(String(item.block.block_number)));
+      row.appendChild(activityCell(DenariusConsole.formatDate(item.block.timestamp)));
+      row.appendChild(activityCell(transaction.transaction_id || "Coinbase", "hash-value"));
+      row.dataset.search = row.innerText.toLowerCase();
+      body.appendChild(row);
+    });
+    document.getElementById("confirmed_badge").textContent = items.length;
+    document.getElementById("confirmed_empty").style.display = items.length ? "none" : "block";
+  }
+
+  function loadActivity() {
+    $.getJSON("/api/transactions").done(function (response) {
+      renderPending(response.transactions);
+    }).fail(function () {
+      DenariusConsole.notice("Unable to load pending transactions.", "danger");
+    });
+    $.getJSON("/api/chain").done(function (response) {
+      renderConfirmed(confirmedTransactions(response.chain));
+      DenariusConsole.setNodeStatus(true);
+    }).fail(function () {
+      DenariusConsole.setNodeStatus(false);
+      DenariusConsole.notice("Unable to load confirmed transactions.", "danger");
+    });
+  }
+
+  $(function () {
+    loadActivity();
+    $("#refresh_activity").click(loadActivity);
+    $("#activity_search").on("input", function () {
+      var query = this.value.trim().toLowerCase();
+      document.querySelectorAll("#pending_rows tr, #confirmed_rows tr").forEach(function (row) {
+        row.style.display = !query || row.dataset.search.indexOf(query) !== -1 ? "" : "none";
+      });
+    });
+  });
+</script>
+{% endblock %}

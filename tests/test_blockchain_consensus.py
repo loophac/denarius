@@ -643,18 +643,16 @@ def test_chainwork_uses_exact_target_formula():
 
 
 def test_transaction_tables_format_atomic_values_as_denarii():
-    miner_template = (ROOT / "blockchain" / "templates" / "index.html").read_text()
-    client_template = (ROOT / "blockchain_client" / "templates" / "view_transactions.html").read_text()
-    send_template = (ROOT / "blockchain_client" / "templates" / "make_transaction.html").read_text()
+    console_source = (ROOT / "blockchain_client" / "static" / "js" / "console.js").read_text()
+    activity_template = (ROOT / "blockchain_client" / "templates" / "activity.html").read_text()
+    send_template = (ROOT / "blockchain_client" / "templates" / "send.html").read_text()
 
-    for template in (miner_template, client_template):
-        assert "function formatDenarii" in template
-        assert 'response["chain"].length' in template
-        assert 'formatDenarii(response["chain"][i]["transactions"][j]["amount_atomic"])' in template
+    assert "function formatDenarii" in console_source
+    assert "DenariusConsole.formatDenarii(transaction.amount_atomic)" in activity_template
 
-    assert "confirmation_amount_display" in send_template
-    assert 'formatDenarii(response["transaction"]["amount_atomic"])' in send_template
-    assert 'response["transaction_id"]' in send_template
+    assert "review_amount" in send_template
+    assert "DenariusConsole.formatDenarii(transaction.amount_atomic)" in send_template
+    assert "response.transaction_id" in send_template
 
 
 def test_confirmed_denarii_monetary_policy():
@@ -806,8 +804,8 @@ def test_json_migration_rejects_incomplete_state():
 
 
 def test_wallet_ui_never_requests_or_displays_raw_private_keys():
-    create_template = (ROOT / "blockchain_client" / "templates" / "index.html").read_text()
-    send_template = (ROOT / "blockchain_client" / "templates" / "make_transaction.html").read_text()
+    create_template = (ROOT / "blockchain_client" / "templates" / "wallets.html").read_text()
+    send_template = (ROOT / "blockchain_client" / "templates" / "send.html").read_text()
     store_source = (ROOT / "blockchain_client" / "static" / "js" / "wallet_store.js").read_text()
 
     assert "private_key" not in create_template
@@ -832,11 +830,24 @@ def test_wallet_service_accepts_a_browser_stored_wallet_document():
         denarius_client.request.files = original_files
 
 
-def test_node_and_dashboard_are_separate_process_boundaries():
+def test_node_and_console_are_separate_process_boundaries():
     node_source = MODULE_PATH.read_text()
-    dashboard_source = DASHBOARD_MODULE_PATH.read_text()
+    console_source = CLIENT_MODULE_PATH.read_text()
+    launcher_source = (ROOT / "run_denarius.py").read_text()
 
     assert "render_template" not in node_source
     assert "X-Denarius-Admin-Token" in node_source
-    assert "X-Denarius-Admin-Token" in dashboard_source
-    assert "render_template" in dashboard_source
+    assert "X-Denarius-Admin-Token" in console_source
+    assert "render_template" in console_source
+    assert "node_dashboard/dashboard.py" not in launcher_source
+    assert "blockchain_client/blockchain_client.py" in launcher_source
+
+
+def test_phase_three_uses_one_coherent_console_navigation():
+    base_template = (ROOT / "blockchain_client" / "templates" / "base.html").read_text()
+    launcher_source = (ROOT / "run_denarius.py").read_text()
+
+    for destination in ("Overview", "Wallets", "Send", "Activity", "Network"):
+        assert destination in base_template
+    assert "--console-port" in launcher_source
+    assert "--dashboard-port" not in launcher_source

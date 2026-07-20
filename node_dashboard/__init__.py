@@ -1,1 +1,1 @@
-"""Local Denarius node dashboard."""
+"""Compatibility package for the unified Denarius console."""

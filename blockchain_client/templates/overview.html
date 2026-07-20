@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block title %}Overview | Denarius Console{% endblock %}
+{% block page_title %}Overview{% endblock %}
+{% block page_subtitle %}Local node, wallet, and network status{% endblock %}
+
+{% block content %}
+  <section class="metric-grid" aria-label="Node summary">
+    <div class="metric">
+      <div class="metric-label">Chain Height</div>
+      <div class="metric-value" id="chain_height">--</div>
+      <div class="metric-detail" id="chain_detail">Waiting for node</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Pending</div>
+      <div class="metric-value" id="pending_count">--</div>
+      <div class="metric-detail">Transactions awaiting a block</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Miner Balance</div>
+      <div class="metric-value" id="miner_balance">--</div>
+      <div class="metric-detail" id="miner_name">Miner not configured</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Peers</div>
+      <div class="metric-value" id="peer_count">--</div>
+      <div class="metric-detail">Configured network connections</div>
+    </div>
+  </section>
+
+  <div class="section-row">
+    <section class="console-section">
+      <div class="section-heading">
+        <div>
+          <h2>Recent Activity</h2>
+          <p>Newest confirmed transactions</p>
+        </div>
+        <a href="/activity" class="btn btn-outline-secondary btn-sm">View all</a>
+      </div>
+      <div class="surface flush table-responsive">
+        <table class="table data-table" aria-label="Recent transactions">
+          <thead>
+            <tr>
+              <th style="width:18%">Type</th>
+              <th style="width:25%">From</th>
+              <th style="width:25%">To</th>
+              <th style="width:20%">Amount</th>
+              <th style="width:12%">Block</th>
+            </tr>
+          </thead>
+          <tbody id="recent_activity"></tbody>
+        </table>
+        <div id="recent_empty" class="empty-state">No confirmed transactions yet.</div>
+      </div>
+    </section>
+
+    <aside>
+      <section class="console-section">
+        <div class="section-heading"><h2>Miner</h2></div>
+        <div class="surface">
+          <dl class="miner-summary mb-0">
+            <div class="summary-item">
+              <dt>Name</dt>
+              <dd id="miner_summary_name">--</dd>
+            </div>
+            <div class="summary-item">
+              <dt>Reward Address</dt>
+              <dd class="wallet-address" id="miner_address">--</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="console-section">
+        <div class="section-heading"><h2>Actions</h2></div>
+        <div class="surface quick-actions">
+          <button type="button" class="btn btn-primary" id="mine_block">Mine next block</button>
+          <a class="btn btn-outline-primary" href="/send">Send Denarii</a>
+          <button type="button" class="btn btn-outline-secondary" id="sync_chain">Synchronize network</button>
+        </div>
+      </section>
+    </aside>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function compactAddress(address) {
+    if (!address || address.length < 20) {
+      return address || "--";
+    }
+    return address.slice(0, 9) + "..." + address.slice(-7);
+  }
+
+  function addRecentTransaction(transaction, blockNumber) {
+    var row = document.createElement("tr");
+    var isCoinbase = transaction.sender_address === "DENARIUS_COINBASE";
+    [
+      isCoinbase ? "Coinbase" : "Transfer",
+      isCoinbase ? "Network" : compactAddress(transaction.sender_address),
+      compactAddress(transaction.recipient_address),
+      DenariusConsole.formatDenarii(transaction.amount_atomic),
+      String(blockNumber)
+    ].forEach(function (value, index) {
+      var cell = document.createElement("td");
+      cell.textContent = value;
+      if (index === 1 || index === 2) {
+        cell.title = index === 1 ? transaction.sender_address : transaction.recipient_address;
+      }
+      row.appendChild(cell);
+    });
+    document.getElementById("recent_activity").appendChild(row);
+  }
+
+  function loadOverview() {
+    $.getJSON("/api/chain").done(function (response) {
+      DenariusConsole.setNodeStatus(true);
+      var height = Math.max(0, Number(response.length) - 1);
+      document.getElementById("chain_height").textContent = height.toLocaleString();
+      document.getElementById("chain_detail").textContent = response.length.toLocaleString() + " total blocks";
+      var remaining = 8;
+      document.getElementById("recent_activity").textContent = "";
+      for (var i = response.chain.length - 1; i >= 1 && remaining > 0; i -= 1) {
+        var block = response.chain[i];
+        for (var j = block.transactions.length - 1; j >= 0 && remaining > 0; j -= 1) {
+          addRecentTransaction(block.transactions[j], block.block_number);
+          remaining -= 1;
+        }
+      }
+      document.getElementById("recent_empty").style.display = remaining === 8 ? "block" : "none";
+    }).fail(function () {
+      DenariusConsole.setNodeStatus(false);
+    });
+
+    $.getJSON("/api/transactions").done(function (response) {
+      document.getElementById("pending_count").textContent = response.transactions.length.toLocaleString();
+    });
+
+    $.getJSON("/api/miner").done(function (response) {
+      document.getElementById("miner_balance").textContent = response.balance + " DEN";
+      document.getElementById("miner_name").textContent = response.name;
+      document.getElementById("miner_summary_name").textContent = response.name;
+      document.getElementById("miner_address").textContent = response.address;
+    });
+
+    $.getJSON("/api/nodes").done(function (response) {
+      document.getElementById("peer_count").textContent = response.nodes.length.toLocaleString();
+    });
+  }
+
+  $(function () {
+    loadOverview();
+    $("#mine_block").click(function () {
+      var button = this;
+      button.disabled = true;
+      $.post("/api/mine").done(function () {
+        DenariusConsole.notice("A new block was mined.", "success");
+        loadOverview();
+      }).fail(function (error) {
+        DenariusConsole.notice(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "Unable to mine a block.", "danger");
+      }).always(function () {
+        button.disabled = false;
+      });
+    });
+    $("#sync_chain").click(function () {
+      var button = this;
+      button.disabled = true;
+      $.post("/api/resolve").done(function (response) {
+        DenariusConsole.notice(response.message || "Network synchronization finished.", "success");
+        loadOverview();
+      }).fail(function () {
+        DenariusConsole.notice("Unable to synchronize the network.", "danger");
+      }).always(function () {
+        button.disabled = false;
+      });
+    });
+  });
+</script>
+{% endblock %}

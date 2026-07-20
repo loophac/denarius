@@ -1,32 +1,19 @@
-# Inside triple quote is left by the original author. Check out REAME for more info on the refined info.
-'''
-title           : blockchain_client.py
-description     : A blockchain client implemenation, with the following features
-                  - Wallet generation using Ed25519 keys
-                  - Generation of signed transactions
-author          : Adil Moujahid
-date_created    : 20180212
-date_modified   : 20180309
-version         : 0.3
-usage           : python blockchain_client.py
-                  python blockchain_client.py -p 8080
-                  python blockchain_client.py --port 8080
-python_version  : 3.6.1
-Comments        : Wallet generation and transaction signature is based on [1]
-References      : [1] https://github.com/julienr/ipynb_playground/blob/master/bitcoin/dumbcoin/dumbcoin.ipynb
-'''
-
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
-
 import binascii
+import hashlib
+import hmac
 import json
+import os
+import secrets
 import sys
+from decimal import Decimal, InvalidOperation
+from functools import wraps
+from pathlib import Path
+from urllib.parse import quote, urlparse
 
+import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
-
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -46,6 +33,9 @@ from denarius_crypto import (
 )
 
 MAX_WALLET_DOCUMENT_BYTES = 64 * 1024
+PASSWORD_ITERATIONS = 240000
+NODE_TIMEOUT = 5
+ADMIN_TOKEN_ENV = 'DENARIUS_ADMIN_TOKEN'
 
 
 class Transaction:
@@ -113,21 +103,223 @@ class Transaction:
 
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
-app.config['MAX_CONTENT_LENGTH'] = 256 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.secret_key = os.environ.get('DENARIUS_SECRET_KEY') or secrets.token_hex(32)
+
+registered_user = None
+
+
+def node_base_url():
+    configured = os.environ.get('DENARIUS_NODE_URL', 'http://127.0.0.1:5000').rstrip('/')
+    parsed = urlparse(configured)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        raise ValueError('DENARIUS_NODE_URL must be an HTTP or HTTPS node URL')
+    if parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+        raise ValueError('DENARIUS_NODE_URL must not contain credentials, paths, or query data')
+    return configured
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf8'), salt, PASSWORD_ITERATIONS)
+    return salt.hex() + ':' + digest.hex()
+
+
+def verify_password(password, encoded_password):
+    try:
+        salt_hex, expected_hex = encoded_password.split(':', 1)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(expected_hex)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    actual = hashlib.pbkdf2_hmac('sha256', password.encode('utf8'), salt, PASSWORD_ITERATIONS)
+    return hmac.compare_digest(actual, expected)
+
+
+def ensure_csrf_token():
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_hex(32)
+    return session['csrf_token']
+
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if registered_user is None:
+            return redirect(url_for('register'))
+        if 'user' not in session:
+            return redirect(url_for('login'))
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def csrf_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        submitted_token = request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
+        session_token = session.get('csrf_token')
+        if not session_token or not submitted_token or not hmac.compare_digest(session_token, submitted_token):
+            return jsonify({'message': 'Invalid CSRF token'}), 403
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def relay_response(response):
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {'message': response.text or 'Node returned an unreadable response'}
+    return jsonify(payload), response.status_code
+
+
+def node_get(path):
+    try:
+        response = requests.get(node_base_url() + path, timeout=NODE_TIMEOUT)
+    except (requests.RequestException, ValueError) as exc:
+        return jsonify({'message': 'Unable to reach the Denarius node', 'detail': str(exc)}), 502
+    return relay_response(response)
+
+
+def node_post(path, form=None, admin=False):
+    headers = {}
+    if admin:
+        admin_token = os.environ.get(ADMIN_TOKEN_ENV)
+        if not admin_token or len(admin_token) < 32:
+            return jsonify({'message': 'DENARIUS_ADMIN_TOKEN is not configured'}), 503
+        headers['X-Denarius-Admin-Token'] = admin_token
+    try:
+        response = requests.post(
+            node_base_url() + path,
+            data=form or {},
+            headers=headers,
+            timeout=NODE_TIMEOUT,
+        )
+    except (requests.RequestException, ValueError) as exc:
+        return jsonify({'message': 'Unable to reach the Denarius node', 'detail': str(exc)}), 502
+    return relay_response(response)
+
+
+def render_console(template_name, active_page):
+    return render_template(
+        template_name,
+        active_page=active_page,
+        csrf_token=ensure_csrf_token(),
+        username=session.get('user'),
+    )
 
 @app.route('/')
+@login_required
 def index():
-    return render_template('./index.html')
+    return render_console('overview.html', 'overview')
+
+
+@app.route('/wallets')
+@login_required
+def wallets():
+    return render_console('wallets.html', 'wallets')
+
+
+@app.route('/send')
+@login_required
+def send():
+    return render_console('send.html', 'send')
+
+
+@app.route('/activity')
+@login_required
+def activity():
+    return render_console('activity.html', 'activity')
+
+
+@app.route('/network')
+@login_required
+def network():
+    return render_console('network.html', 'network')
 
 
 @app.route('/make/transaction')
-def make_transaction():
-    return render_template('./make_transaction.html')
+@login_required
+def legacy_make_transaction():
+    return redirect(url_for('send'))
 
 
 @app.route('/view/transactions')
-def view_transaction():
-    return render_template('./view_transactions.html')
+@login_required
+def legacy_view_transactions():
+    return redirect(url_for('activity'))
+
+
+@app.route('/configure')
+@login_required
+def legacy_configure():
+    return redirect(url_for('network'))
+
+
+@app.route('/api/chain')
+@login_required
+def api_chain():
+    return node_get('/chain')
+
+
+@app.route('/api/accounts/<address>')
+@login_required
+def api_account(address):
+    return node_get('/accounts/' + quote(address, safe=''))
+
+
+@app.route('/api/transactions', methods=['GET'])
+@login_required
+def api_pending_transactions():
+    return node_get('/transactions/get')
+
+
+@app.route('/api/transactions', methods=['POST'])
+@login_required
+@csrf_required
+def api_submit_transaction():
+    return node_post('/transactions/new', request.form)
+
+
+@app.route('/api/miner', methods=['GET'])
+@login_required
+def api_miner():
+    return node_get('/miner/get')
+
+
+@app.route('/api/miner', methods=['POST'])
+@login_required
+@csrf_required
+def api_register_miner():
+    return node_post('/miner/register', request.form, admin=True)
+
+
+@app.route('/api/nodes', methods=['GET'])
+@login_required
+def api_nodes():
+    return node_get('/nodes/get')
+
+
+@app.route('/api/nodes', methods=['POST'])
+@login_required
+@csrf_required
+def api_register_nodes():
+    return node_post('/nodes/register', request.form, admin=True)
+
+
+@app.route('/api/mine', methods=['POST'])
+@login_required
+@csrf_required
+def api_mine():
+    return node_post('/mine', admin=True)
+
+
+@app.route('/api/resolve', methods=['POST'])
+@login_required
+@csrf_required
+def api_resolve():
+    return node_post('/nodes/resolve', admin=True)
 
 
 def submitted_wallet_document():
@@ -150,7 +342,10 @@ def submitted_wallet_document():
     return document
 
 
+@app.route('/api/wallets/new', methods=['POST'])
 @app.route('/wallet/new', methods=['POST'])
+@login_required
+@csrf_required
 def new_wallet():
     try:
         wallet_document = generate_encrypted_wallet(request.form.get('password', ''))
@@ -165,7 +360,10 @@ def new_wallet():
     return jsonify(response), 200
 
 
+@app.route('/api/wallets/inspect', methods=['POST'])
 @app.route('/wallet/inspect', methods=['POST'])
+@login_required
+@csrf_required
 def inspect_wallet():
     try:
         metadata = wallet_public_metadata(submitted_wallet_document())
@@ -174,7 +372,10 @@ def inspect_wallet():
     return jsonify(metadata), 200
 
 
+@app.route('/api/transactions/sign', methods=['POST'])
 @app.route('/generate/transaction', methods=['POST'])
+@login_required
+@csrf_required
 def generate_transaction():
     try:
         wallet_data = decrypt_wallet(
@@ -209,14 +410,70 @@ def generate_transaction():
     return jsonify(response), 200
 
 
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    global registered_user
+    if registered_user:
+        return redirect(url_for('login'))
+    error = None
+    if request.method == 'POST':
+        submitted_token = request.form.get('csrf_token')
+        if not submitted_token or not hmac.compare_digest(ensure_csrf_token(), submitted_token):
+            error = 'Your session expired. Please try again.'
+        else:
+            username = request.form.get('username', '').strip()
+            password = request.form.get('password', '')
+            if not username or len(username) > 64 or len(password) < 10:
+                error = 'Enter a username and a password of at least 10 characters.'
+            else:
+                registered_user = {'username': username, 'password_hash': hash_password(password)}
+                session.clear()
+                session['user'] = username
+                ensure_csrf_token()
+                return redirect(url_for('index'))
+    return render_template('register.html', csrf_token=ensure_csrf_token(), error=error), 400 if error else 200
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        submitted_token = request.form.get('csrf_token')
+        if not submitted_token or not hmac.compare_digest(ensure_csrf_token(), submitted_token):
+            error = 'Your session expired. Please try again.'
+        else:
+            username = request.form.get('username', '')
+            password = request.form.get('password', '')
+            if (
+                registered_user
+                and username == registered_user['username']
+                and verify_password(password, registered_user['password_hash'])
+            ):
+                session.clear()
+                session['user'] = username
+                ensure_csrf_token()
+                return redirect(url_for('index'))
+            error = 'The username or password is incorrect.'
+    return render_template('login.html', csrf_token=ensure_csrf_token(), error=error), 403 if error else 200
+
+
+@app.route('/logout', methods=['POST'])
+@login_required
+@csrf_required
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
 if __name__ == '__main__':
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
-    parser.add_argument('-p', '--port', default=8080, type=int, help='port to listen on')
+    parser.add_argument('-p', '--port', default=8080, type=int, help='console port to listen on')
     args = parser.parse_args()
     port = args.port
 
+    node_base_url()
     app.run(host='127.0.0.1', port=port)
 
 
