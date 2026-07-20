@@ -130,7 +130,7 @@
                   transaction = [count,
                                 response["chain"][i]["transactions"][j]["recipient_address"],
                                 response["chain"][i]["transactions"][j]["sender_address"],
-                                formatDenarii(response["chain"][i]["transactions"][j]["value"]),
+                                formatDenarii(response["chain"][i]["transactions"][j]["amount_atomic"]),
                                 formattedDateTime,
                                 response["chain"][i]["block_number"]];
                   transactions.push(transaction);

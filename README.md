@@ -30,8 +30,28 @@ Compared with the original one, we now introduce:
 - Basic peer request timeouts, request size limits, and mempool/block limits.
 - Password-hashed local node administration with CSRF-protected controls.
 - Transaction failure alert.
-- Dynamic `difficulty` update every 2 weeks.
+- Deterministic proof-of-work target adjustment every 10,080 blocks.
+- Exact accumulated-work comparison during chain resolution.
+- Account nonces and stable transaction IDs for replay and ordering protection.
+- Merkle-root commitments over each block's transactions.
 - Save running states.
+
+
+## Denarii monetary policy
+
+Denarius is the network and project, Denarii is its currency, and `DEN` is the
+currency notation. Consensus uses integer atomic units, with
+`1 DEN = 100,000,000` atomic units.
+
+- Maximum supply: `100,000,000 DEN`
+- Target block time: `2 minutes`
+- Subsidy halving interval: `1,051,200 blocks` (approximately four years)
+- Initial block subsidy: `47.56468797 DEN`
+- Difficulty target adjustment: every `10,080 blocks` (approximately two weeks)
+
+Integer subsidy rounding keeps scheduled issuance below the hard cap. The
+consensus values and canonical serialization rules live in
+`denarius_protocol.py` so the node and wallet sign and validate identical data.
 
 
 ## Requirements
@@ -72,10 +92,11 @@ Set `DENARIUS_SECRET_KEY` in a managed deployment instead of relying on the
 random session-signing secret generated at startup. Administrator registration
 is intentionally local and must currently be repeated after a process restart.
 
-Phase 0 changed proof-of-work so that it secures every consensus field in a
-block. State files created by older versions use the previous proof format and
-are intentionally rejected. Archive an old state file and start without `-r`
-to create a fresh Phase 0 chain.
+Phase 1 uses protocol version 2, account nonces, transaction IDs, Merkle roots,
+and deterministic proof-of-work targets. State files created by Phase 0 or
+older versions use a different consensus format and are intentionally rejected.
+Archive an old state file and start without `-r` to create a fresh Phase 1
+chain.
 
 To run blockchain client:
 
@@ -86,8 +107,11 @@ python blockchain_client/blockchain_client.py -p 8080
 The wallet UI generates an Ed25519 private key, raw public key, and checked
 Denarius address. Use the checked address for sender, recipient, and miner
 fields. The wallet UI accepts ordinary DEN amounts and normalizes them to atomic
-units before signing. The node's `/transactions/new` endpoint expects the signed
-atomic-unit value from the client.
+units before signing. Before creating a signature, the wallet reads the sender's
+next nonce from the selected node. The node's `/transactions/new` endpoint
+expects `sender_address`, `recipient_address`, `amount` (in atomic units),
+`nonce`, `signature`, and `transaction_id`. Account balance and nonce state are
+available from `GET /accounts/<address>`.
 
 To run the tests:
 
@@ -95,13 +119,11 @@ To run the tests:
 pytest
 ```
 
-The regression tests cover the core consensus checks: forged signatures, invalid
-amounts, pending double-spends, invalid genesis blocks, incorrect and duplicate
-coinbase rewards, duplicate signed transactions, malformed peer responses,
-oversized blocks, chainwork-based conflict resolution, JSON state loading, and
-Denarii display formatting for atomic transaction values. They also verify that
-coinbase destinations and block metadata are secured by proof-of-work, confirmed
-transactions cannot be replayed, and a miner cannot append a self-invalid block.
+The regression tests cover monetary policy, canonical transaction IDs, account
+nonces, forged signatures, invalid amounts, pending double-spends, invalid
+genesis blocks, incorrect and duplicate coinbase rewards, malformed peer
+responses, Merkle commitments, deterministic targets, exact chainwork, JSON
+state loading, and Denarii display formatting.
 
 ## Security notes
 

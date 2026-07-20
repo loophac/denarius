@@ -78,6 +78,8 @@ client_spec.loader.exec_module(denarius_client)
 Blockchain = denarius_blockchain.Blockchain
 Transaction = denarius_client.Transaction
 
+import denarius_protocol
+
 
 def mine_block(blockchain):
     block = blockchain.mine_pending_transactions(relay=False, persist=False)
@@ -114,20 +116,40 @@ def wallet(blockchain):
     )
 
 
-def signed_transaction(sender_address, private_key, recipient_address, value):
-    transaction = Transaction(sender_address, private_key, recipient_address, value)
-    return transaction.to_dict(), transaction.sign_transaction()
+def signed_transaction(sender_address, private_key, recipient_address, value, nonce=0):
+    transaction = Transaction(sender_address, private_key, recipient_address, value, nonce)
+    signature, transaction_id = transaction.signed_data()
+    signed = OrderedDict(transaction.to_dict())
+    signed["signature"] = signature
+    signed["transaction_id"] = transaction_id
+    return signed, signature
 
 
-def signed_atomic_transaction(sender_address, private_key, recipient_address, atomic_value):
-    transaction = OrderedDict({
-        "sender_address": sender_address,
-        "recipient_address": recipient_address,
-        "value": str(atomic_value),
-    })
+def signed_atomic_transaction(sender_address, private_key, recipient_address, atomic_value, nonce=0):
+    transaction = denarius_blockchain.transaction_signing_payload(
+        sender_address, recipient_address, atomic_value, nonce
+    )
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(binascii.unhexlify(private_key))
-    signature = private_key.sign(json.dumps(transaction, sort_keys=True, separators=(',', ':')).encode('utf8'))
-    return transaction, binascii.hexlify(signature).decode("ascii")
+    signature = binascii.hexlify(
+        private_key.sign(denarius_blockchain.canonical_json_bytes(transaction))
+    ).decode("ascii")
+    transaction["signature"] = signature
+    transaction["transaction_id"] = denarius_blockchain.signed_transaction_id(
+        transaction, signature
+    )
+    return transaction, signature
+
+
+def submit_signed(blockchain, transaction, relay=False):
+    return blockchain.submit_transaction(
+        transaction["sender_address"],
+        transaction["recipient_address"],
+        transaction["amount_atomic"],
+        transaction["nonce"],
+        transaction["signature"],
+        transaction["transaction_id"],
+        relay=relay,
+    )
 
 
 def funded_blockchain():
@@ -146,6 +168,8 @@ def test_public_transactions_cannot_create_coinbase_rewards():
         blockchain.COINBASE_SENDER,
         recipient_address,
         str(blockchain.block_reward(1)),
+        0,
+        "",
         "",
     )
 
@@ -159,8 +183,15 @@ def test_rejects_non_positive_and_non_finite_amounts():
     recipient_address, _ = wallet(blockchain)
 
     for amount in ("0", "-1", "NaN", "Infinity"):
-        _, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
-        assert blockchain.submit_transaction(sender_address, recipient_address, amount, signature) is False
+        transaction, _ = signed_transaction(sender_address, private_key, recipient_address, "1")
+        assert blockchain.submit_transaction(
+            sender_address,
+            recipient_address,
+            amount,
+            transaction["nonce"],
+            transaction["signature"],
+            transaction["transaction_id"],
+        ) is False
 
 
 def test_pending_transactions_are_counted_against_balance():
@@ -175,20 +206,12 @@ def test_pending_transactions_are_counted_against_balance():
         bob_address,
         blockchain.format_amount(reward),
     )
-    carol_transaction, carol_signature = signed_transaction(sender_address, private_key, carol_address, "1")
+    carol_transaction, carol_signature = signed_transaction(
+        sender_address, private_key, carol_address, "1", nonce=1
+    )
 
-    assert blockchain.submit_transaction(
-        sender_address,
-        bob_address,
-        bob_transaction["value"],
-        bob_signature,
-    ) == len(blockchain.chain)
-    assert blockchain.submit_transaction(
-        sender_address,
-        carol_address,
-        carol_transaction["value"],
-        carol_signature,
-    ) is False
+    assert submit_signed(blockchain, bob_transaction) == len(blockchain.chain)
+    assert submit_signed(blockchain, carol_transaction) is False
 
 
 def test_ed25519_signature_and_address_checksum_are_required():
@@ -198,27 +221,35 @@ def test_ed25519_signature_and_address_checksum_are_required():
     invalid_sender = sender_address[:-1] + ("0" if sender_address[-1] != "0" else "1")
     invalid_recipient = recipient_address[:-1] + ("0" if recipient_address[-1] != "0" else "1")
 
-    assert blockchain.verify_transaction_signature(sender_address, signature, transaction) is True
-    assert blockchain.verify_transaction_signature(invalid_sender, signature, transaction) is False
+    signing_payload = denarius_blockchain.transaction_signing_payload(
+        sender_address,
+        recipient_address,
+        transaction["amount_atomic"],
+        transaction["nonce"],
+    )
+    assert blockchain.verify_transaction_signature(sender_address, signature, signing_payload) is True
+    assert blockchain.verify_transaction_signature(invalid_sender, signature, signing_payload) is False
     assert blockchain.submit_transaction(
         sender_address,
         invalid_recipient,
-        transaction["value"],
+        transaction["amount_atomic"],
+        transaction["nonce"],
         signature,
+        transaction["transaction_id"],
     ) is False
 
 
 def test_forged_signature_is_rejected():
     blockchain, sender_address, _ = funded_blockchain()
     recipient_address, recipient_private_key = wallet(blockchain)
-    transaction, forged_signature = signed_transaction(sender_address, recipient_private_key, recipient_address, "1")
-
-    assert blockchain.submit_transaction(
+    transaction, _ = signed_atomic_transaction(
         sender_address,
+        recipient_private_key,
         recipient_address,
-        transaction["value"],
-        forged_signature,
-    ) is False
+        blockchain.ATOMIC_UNITS,
+    )
+
+    assert submit_signed(blockchain, transaction) is False
 
 
 def test_valid_chain_requires_canonical_genesis_block():
@@ -233,12 +264,17 @@ def test_valid_chain_rejects_incorrect_coinbase_reward():
     blockchain = Blockchain()
     miner_address, _ = wallet(blockchain)
     blockchain.node_address = miner_address
-    block = mine_candidate(
-        blockchain,
-        lambda candidate: candidate["transactions"][-1].update(
-            value=str(blockchain.block_reward(1) + 1)
-        ),
-    )
+    def set_incorrect_reward(candidate):
+        candidate["transactions"][0] = denarius_blockchain.coinbase_transaction(
+            miner_address,
+            blockchain.block_reward(1) + 1,
+            1,
+        )
+        candidate["merkle_root"] = denarius_blockchain.calculate_merkle_root(
+            candidate["transactions"]
+        )
+
+    block = mine_candidate(blockchain, set_incorrect_reward)
     blockchain.chain.append(block)
 
     assert blockchain.valid_chain(blockchain.chain) is False
@@ -248,23 +284,24 @@ def test_valid_chain_rejects_multiple_coinbase_transactions():
     blockchain = Blockchain()
     miner_address, _ = wallet(blockchain)
     blockchain.node_address = miner_address
-    block = mine_candidate(
-        blockchain,
-        lambda candidate: candidate["transactions"].insert(
-            0, blockchain.create_coinbase_transaction()
-        ),
-    )
+    def add_second_coinbase(candidate):
+        candidate["transactions"].append(blockchain.create_coinbase_transaction())
+        candidate["merkle_root"] = denarius_blockchain.calculate_merkle_root(
+            candidate["transactions"]
+        )
+
+    block = mine_candidate(blockchain, add_second_coinbase)
     blockchain.chain.append(block)
 
     assert blockchain.valid_chain(blockchain.chain) is False
 
 
-def test_valid_chain_rejects_invalid_difficulty():
+def test_valid_chain_rejects_invalid_target():
     blockchain = Blockchain()
     miner_address, _ = wallet(blockchain)
     blockchain.node_address = miner_address
     mine_block(blockchain)
-    blockchain.chain[-1]["difficulty"] = 0
+    blockchain.chain[-1]["target"] = "0" * 64
 
     assert blockchain.valid_chain(blockchain.chain) is False
 
@@ -298,7 +335,6 @@ def test_valid_chain_replays_transaction_balances():
         reward + 1,
     )
 
-    transaction["signature"] = signature
     blockchain.transactions.append(transaction)
     blockchain.chain.append(mine_candidate(blockchain))
 
@@ -310,24 +346,16 @@ def test_submit_rejects_confirmed_transaction_replay():
     recipient_address, _ = wallet(blockchain)
     transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
 
-    assert blockchain.submit_transaction(sender_address, recipient_address, transaction["value"], signature, relay=False)
+    assert submit_signed(blockchain, transaction)
     mine_block(blockchain)
 
-    assert blockchain.submit_transaction(
-        sender_address,
-        recipient_address,
-        transaction["value"],
-        signature,
-        relay=False,
-    ) is False
+    assert submit_signed(blockchain, transaction) is False
 
 
 def test_miner_will_not_append_a_replayed_transaction():
     blockchain, sender_address, private_key = funded_blockchain()
     recipient_address, _ = wallet(blockchain)
     transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
-    transaction["signature"] = signature
-
     blockchain.transactions.append(copy.deepcopy(transaction))
     mine_block(blockchain)
     chain_length = len(blockchain.chain)
@@ -344,7 +372,7 @@ def test_coinbase_recipient_is_bound_to_proof_of_work():
     blockchain.node_address = miner_address
     block = mine_block(blockchain)
     altered_block = copy.deepcopy(block)
-    altered_block["transactions"][-1]["recipient_address"] = thief_address
+    altered_block["transactions"][0]["recipient_address"] = thief_address
 
     assert blockchain.valid_proof(altered_block) is False
     assert blockchain.valid_chain([blockchain.chain[0], altered_block]) is False
@@ -403,14 +431,12 @@ def test_mining_reserves_space_for_coinbase_and_leaves_overflow_pending():
     first_recipient, _ = wallet(blockchain)
     second_recipient, _ = wallet(blockchain)
     first, first_signature = signed_transaction(sender_address, private_key, first_recipient, "1")
-    second, second_signature = signed_transaction(sender_address, private_key, second_recipient, "1")
+    second, second_signature = signed_transaction(
+        sender_address, private_key, second_recipient, "1", nonce=1
+    )
 
-    assert blockchain.submit_transaction(
-        sender_address, first_recipient, first["value"], first_signature, relay=False
-    )
-    assert blockchain.submit_transaction(
-        sender_address, second_recipient, second["value"], second_signature, relay=False
-    )
+    assert submit_signed(blockchain, first)
+    assert submit_signed(blockchain, second)
 
     block = mine_block(blockchain)
 
@@ -476,16 +502,13 @@ def test_submit_transaction_relays_to_known_peers():
     blockchain.nodes.add("127.0.0.1:5001")
 
     with patch.object(denarius_blockchain.requests, "post") as post:
-        result = blockchain.submit_transaction(
-            sender_address,
-            recipient_address,
-            transaction["value"],
-            signature,
-        )
+        result = submit_signed(blockchain, transaction, relay=True)
 
     assert result == len(blockchain.chain)
     post.assert_called_once()
-    assert post.call_args.kwargs["data"]["amount"] == transaction["value"]
+    assert post.call_args.kwargs["data"]["amount"] == transaction["amount_atomic"]
+    assert post.call_args.kwargs["data"]["nonce"] == transaction["nonce"]
+    assert post.call_args.kwargs["data"]["transaction_id"] == transaction["transaction_id"]
     assert post.call_args.kwargs["timeout"] == blockchain.PEER_REQUEST_TIMEOUT
 
 
@@ -497,10 +520,9 @@ def test_accept_block_from_peer_appends_and_removes_pending_transaction():
 
     recipient_address, _ = wallet(peer)
     transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
-    assert local.submit_transaction(sender_address, recipient_address, transaction["value"], signature, relay=False)
+    assert submit_signed(local, transaction)
 
     peer.transactions.append(OrderedDict(transaction))
-    peer.transactions[-1]["signature"] = signature
     block = mine_block(peer)
 
     with patch.object(local, "save_everything"), patch.object(local, "broadcast_block") as broadcast_block:
@@ -514,12 +536,15 @@ def test_accept_block_from_peer_appends_and_removes_pending_transaction():
 def test_accept_block_rejects_invalid_peer_block():
     blockchain = Blockchain()
     block = {
+        "version": blockchain.PROTOCOL_VERSION,
+        "network": blockchain.NETWORK_ID,
         "block_number": 1,
         "timestamp": 1,
+        "merkle_root": denarius_blockchain.calculate_merkle_root([]),
         "transactions": [],
         "nonce": 0,
         "previous_hash": "bad",
-        "difficulty": 1,
+        "target": denarius_blockchain.target_to_hex(denarius_blockchain.INITIAL_TARGET),
     }
 
     assert blockchain.accept_block(block) is False
@@ -558,36 +583,36 @@ def test_resolve_conflicts_ignores_malformed_peer_chain_response():
         assert blockchain.resolve_conflicts() is False
 
 
-def test_resolve_conflicts_prefers_greater_chainwork_over_length():
+def test_resolve_conflicts_prefers_greater_chainwork():
     local = Blockchain()
     local.node_address, _ = wallet(local)
     mine_empty_block(local)
-    local.chain[-1]["difficulty"] = 2
 
-    low_work = Blockchain()
-    low_work.node_address, _ = wallet(low_work)
-    low_work.MINING_DIFFICULTY = 1
-    mine_empty_block(low_work)
-    mine_empty_block(low_work)
+    peer = Blockchain()
+    peer.node_address, _ = wallet(peer)
+    mine_empty_block(peer)
+    mine_empty_block(peer)
 
-    high_work = Blockchain()
-    high_work.node_address, _ = wallet(high_work)
-    high_work.MINING_DIFFICULTY = 3
-    mine_empty_block(high_work)
-
-    local.nodes.update({"low-work", "high-work"})
+    local.nodes.add("peer")
 
     def get_peer_chain(url, timeout):
         response = Mock(status_code=200)
-        response.json.return_value = {
-            "chain": low_work.chain if "low-work" in url else high_work.chain,
-        }
+        response.json.return_value = {"chain": peer.chain}
         return response
 
     with patch.object(denarius_blockchain.requests, "get", side_effect=get_peer_chain):
         assert local.resolve_conflicts() is True
 
-    assert local.chain == high_work.chain
+    assert local.chain == peer.chain
+
+
+def test_chainwork_uses_exact_target_formula():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    mine_empty_block(blockchain)
+
+    target = denarius_blockchain.target_from_hex(blockchain.chain[1]["target"])
+    assert blockchain.chainwork(blockchain.chain) == (1 << 256) // (target + 1)
 
 
 def test_transaction_tables_format_atomic_values_as_denarii():
@@ -598,7 +623,87 @@ def test_transaction_tables_format_atomic_values_as_denarii():
     for template in (miner_template, client_template):
         assert "function formatDenarii" in template
         assert 'response["chain"].length' in template
-        assert 'formatDenarii(response["chain"][i]["transactions"][j]["value"])' in template
+        assert 'formatDenarii(response["chain"][i]["transactions"][j]["amount_atomic"])' in template
 
     assert "confirmation_amount_display" in send_template
-    assert 'formatDenarii(response["transaction"]["value"])' in send_template
+    assert 'formatDenarii(response["transaction"]["amount_atomic"])' in send_template
+    assert 'response["transaction_id"]' in send_template
+
+
+def test_confirmed_denarii_monetary_policy():
+    assert denarius_protocol.MAX_SUPPLY_DEN == 100_000_000
+    assert denarius_protocol.TARGET_BLOCK_SECONDS == 120
+    assert denarius_protocol.HALVING_INTERVAL == 1_051_200
+    assert denarius_protocol.block_reward(1) == 4_756_468_797
+    assert denarius_protocol.block_reward(denarius_protocol.HALVING_INTERVAL) == 4_756_468_797
+    assert denarius_protocol.block_reward(denarius_protocol.HALVING_INTERVAL + 1) == 2_378_234_398
+
+    scheduled_supply = 0
+    height = 1
+    while denarius_protocol.block_reward(height):
+        scheduled_supply += (
+            denarius_protocol.block_reward(height) * denarius_protocol.HALVING_INTERVAL
+        )
+        height += denarius_protocol.HALVING_INTERVAL
+
+    assert scheduled_supply <= denarius_protocol.MAX_SUPPLY_ATOMIC
+
+
+def test_account_nonces_enforce_transaction_order():
+    blockchain, sender_address, private_key = funded_blockchain()
+    first_recipient, _ = wallet(blockchain)
+    second_recipient, _ = wallet(blockchain)
+    first, _ = signed_transaction(sender_address, private_key, first_recipient, "1", nonce=0)
+    second, _ = signed_transaction(sender_address, private_key, second_recipient, "1", nonce=1)
+
+    assert submit_signed(blockchain, second) is False
+    assert submit_signed(blockchain, first)
+    assert blockchain.get_next_nonce(sender_address) == 1
+    assert submit_signed(blockchain, second)
+    assert blockchain.get_next_nonce(sender_address) == 2
+
+    mine_block(blockchain)
+    assert blockchain.get_confirmed_nonce(sender_address) == 2
+    assert blockchain.get_next_nonce(sender_address) == 2
+
+
+def test_transaction_id_commits_to_the_signed_payload():
+    blockchain, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(blockchain)
+    transaction, _ = signed_transaction(sender_address, private_key, recipient_address, "1")
+    altered = copy.deepcopy(transaction)
+    altered["amount_atomic"] = str(2 * blockchain.ATOMIC_UNITS)
+
+    assert blockchain.has_valid_transaction_id(transaction) is True
+    assert blockchain.has_valid_transaction_id(altered) is False
+    assert submit_signed(blockchain, altered) is False
+
+
+def test_mined_block_uses_canonical_phase_one_fields():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    block = mine_block(blockchain)
+
+    assert set(block) == set(denarius_protocol.BLOCK_FIELDS)
+    assert block["version"] == denarius_protocol.PROTOCOL_VERSION
+    assert block["network"] == denarius_protocol.NETWORK_ID
+    assert block["transactions"][0]["sender_address"] == denarius_protocol.COINBASE_SENDER
+    assert block["merkle_root"] == denarius_protocol.calculate_merkle_root(block["transactions"])
+    assert block["target"] == denarius_protocol.target_to_hex(denarius_protocol.INITIAL_TARGET)
+
+
+def test_retarget_is_deterministic_and_time_bounded():
+    blockchain = Blockchain()
+    chain = []
+    block_spacing = denarius_protocol.TARGET_BLOCK_SECONDS // 2
+    for height in range(denarius_protocol.RETARGET_INTERVAL):
+        chain.append({
+            "timestamp": denarius_protocol.GENESIS_BLOCK["timestamp"] + height * block_spacing,
+            "target": denarius_protocol.target_to_hex(denarius_protocol.INITIAL_TARGET),
+        })
+
+    elapsed = chain[-1]["timestamp"] - chain[0]["timestamp"]
+    expected = denarius_protocol.INITIAL_TARGET * elapsed // denarius_protocol.RETARGET_TIMESPAN
+
+    assert blockchain.expected_target(chain, denarius_protocol.RETARGET_INTERVAL) == expected
+    assert blockchain.expected_target(chain, denarius_protocol.RETARGET_INTERVAL - 1) == denarius_protocol.INITIAL_TARGET
