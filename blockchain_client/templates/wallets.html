@@ -59,8 +59,9 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/js/wallet_crypto.js"></script>
 <script src="/static/js/wallet_store.js"></script>
-<script>
+<script nonce="{{ csp_nonce }}">
   function showWalletError(message) {
     var errorBox = document.getElementById("wallet_error");
     errorBox.textContent = message;
@@ -74,6 +75,9 @@
   function loadWalletBalance(address, element) {
     $.getJSON("/api/accounts/" + encodeURIComponent(address)).done(function (account) {
       element.textContent = account.balance + " DEN";
+      if (account.immature_balance_atomic !== "0") {
+        element.textContent += " (" + account.immature_balance + " immature)";
+      }
     }).fail(function () {
       element.textContent = "Unavailable";
     });
@@ -141,26 +145,30 @@
     $("#generate_wallet").click(function () {
       var password = document.getElementById("wallet_password").value;
       var confirmation = document.getElementById("wallet_password_confirm").value;
+      var button = this;
       document.getElementById("wallet_error").style.display = "none";
       document.getElementById("wallet_result").style.display = "none";
       if (password.length < 10 || password !== confirmation) {
         showWalletError("Passwords must match and contain at least 10 characters.");
         return;
       }
-      $.post("/api/wallets/new", {password: password}).done(function (response) {
+      button.disabled = true;
+      DenariusWalletCrypto.create(password).then(function (wallet) {
         try {
-          DenariusWalletStore.save(response.wallet);
+          DenariusWalletStore.save(wallet);
         } catch (error) {
           showWalletError("This browser could not save the wallet.");
           return;
         }
-        document.getElementById("created_address").textContent = response.address;
+        document.getElementById("created_address").textContent = wallet.address;
         document.getElementById("wallet_result").style.display = "block";
         document.getElementById("wallet_password").value = "";
         document.getElementById("wallet_password_confirm").value = "";
         renderWallets();
-      }).fail(function (error) {
-        showWalletError(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "Unable to create the wallet.");
+      }).catch(function (error) {
+        showWalletError(error.message || "Unable to create the wallet.");
+      }).finally(function () {
+        button.disabled = false;
       });
     });
 
@@ -176,16 +184,12 @@
       var reader = new FileReader();
       reader.onload = function () {
         var walletJson = String(reader.result);
-        $.post("/api/wallets/inspect", {wallet_document: walletJson}).done(function () {
-          try {
-            DenariusWalletStore.save(JSON.parse(walletJson));
-            renderWallets();
-            DenariusConsole.notice("Wallet backup imported.", "success");
-          } catch (error) {
-            showWalletError("Unable to save that wallet backup.");
-          }
-        }).fail(function (error) {
-          showWalletError(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "That wallet backup is invalid.");
+        DenariusWalletCrypto.importBackup(walletJson).then(function (wallet) {
+          DenariusWalletStore.save(wallet);
+          renderWallets();
+          DenariusConsole.notice("Wallet backup imported.", "success");
+        }).catch(function (error) {
+          showWalletError(error.message || "That wallet backup is invalid.");
         });
       };
       reader.readAsText(file);

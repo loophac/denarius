@@ -108,7 +108,7 @@
 
 {% block scripts %}
 <script src="/static/js/wallet_store.js"></script>
-<script>
+<script nonce="{{ csp_nonce }}">
   var currentMiner = null;
 
   function populateMinerWallets(currentAddress) {

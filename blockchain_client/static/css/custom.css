@@ -296,6 +296,19 @@ body {
   text-align: left;
 }
 
+.automine-action {
+  display: grid;
+  gap: 4px;
+}
+
+.automine-action .btn {
+  width: 100%;
+}
+
+.automine-action small {
+  min-height: 18px;
+}
+
 .data-table {
   margin-bottom: 0;
   table-layout: fixed;

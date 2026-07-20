@@ -74,6 +74,10 @@
         <div class="section-heading"><h2>Actions</h2></div>
         <div class="surface quick-actions">
           <button type="button" class="btn btn-primary" id="mine_block">Mine next block</button>
+          <div class="automine-action">
+            <button type="button" class="btn btn-outline-primary" id="toggle_automine" data-running="false">Start automining</button>
+            <small class="text-muted" id="automine_status">Automining stopped</small>
+          </div>
           <a class="btn btn-outline-primary" href="/send">Send Denarii</a>
           <button type="button" class="btn btn-outline-secondary" id="sync_chain">Synchronize network</button>
         </div>
@@ -83,7 +87,9 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
+  var overviewRefreshTimer = null;
+
   function compactAddress(address) {
     if (!address || address.length < 20) {
       return address || "--";
@@ -119,7 +125,7 @@
       document.getElementById("chain_detail").textContent = response.length.toLocaleString() + " total blocks";
       var remaining = 8;
       document.getElementById("recent_activity").textContent = "";
-      for (var i = response.chain.length - 1; i >= 1 && remaining > 0; i -= 1) {
+      for (var i = response.chain.length - 1; i >= 0 && remaining > 0; i -= 1) {
         var block = response.chain[i];
         for (var j = block.transactions.length - 1; j >= 0 && remaining > 0; j -= 1) {
           addRecentTransaction(block.transactions[j], block.block_number);
@@ -148,6 +154,46 @@
       document.getElementById("peer_count").textContent = response.nodes.length.toLocaleString();
       document.getElementById("peer_detail").textContent = healthy.toLocaleString() + " healthy connection" + (healthy === 1 ? "" : "s");
     });
+
+    loadAutomining();
+  }
+
+  function scheduleOverviewRefresh(running) {
+    if (running && overviewRefreshTimer === null) {
+      overviewRefreshTimer = window.setInterval(loadOverview, 3000);
+    } else if (!running && overviewRefreshTimer !== null) {
+      window.clearInterval(overviewRefreshTimer);
+      overviewRefreshTimer = null;
+    }
+  }
+
+  function renderAutomining(status) {
+    var running = Boolean(status.running);
+    var button = document.getElementById("toggle_automine");
+    var statusText = document.getElementById("automine_status");
+    button.dataset.running = running ? "true" : "false";
+    button.textContent = running ? "Stop automining" : "Start automining";
+    button.className = running ? "btn btn-outline-danger" : "btn btn-outline-primary";
+    document.getElementById("mine_block").disabled = running;
+    if (status.last_error) {
+      statusText.textContent = "Automining error: " + status.last_error;
+      statusText.className = "text-danger";
+    } else if (running) {
+      statusText.textContent = "Running - " + Number(status.blocks_mined || 0).toLocaleString() + " blocks mined this session";
+      statusText.className = "text-success";
+    } else {
+      statusText.textContent = "Automining stopped";
+      statusText.className = "text-muted";
+    }
+    scheduleOverviewRefresh(running);
+  }
+
+  function loadAutomining() {
+    $.getJSON("/api/automine").done(renderAutomining).fail(function () {
+      scheduleOverviewRefresh(false);
+      document.getElementById("automine_status").textContent = "Automining status unavailable";
+      document.getElementById("automine_status").className = "text-danger";
+    });
   }
 
   $(function () {
@@ -160,6 +206,21 @@
         loadOverview();
       }).fail(function (error) {
         DenariusConsole.notice(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "Unable to mine a block.", "danger");
+      }).always(function () {
+        button.disabled = false;
+        loadAutomining();
+      });
+    });
+    $("#toggle_automine").click(function () {
+      var button = this;
+      var action = button.dataset.running === "true" ? "stop" : "start";
+      button.disabled = true;
+      $.post("/api/automine", {action: action}).done(function (response) {
+        renderAutomining(response);
+        DenariusConsole.notice(response.message, "success");
+        loadOverview();
+      }).fail(function (error) {
+        DenariusConsole.notice(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "Unable to change automining.", "danger");
       }).always(function () {
         button.disabled = false;
       });

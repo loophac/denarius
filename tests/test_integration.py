@@ -22,7 +22,7 @@ CSRF_PATTERNS = (
 ALLOCATED_PORTS = set()
 
 try:
-    for distribution in ("Flask", "Flask-Cors", "cryptography", "requests"):
+    for distribution in ("Flask", "cryptography", "requests", "waitress"):
         importlib.metadata.version(distribution)
 except importlib.metadata.PackageNotFoundError:
     RUNTIME_DEPENDENCIES_AVAILABLE = False
@@ -46,6 +46,18 @@ def unused_port():
         if port not in ALLOCATED_PORTS:
             ALLOCATED_PORTS.add(port)
             return port
+
+
+def new_denarius_address():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from denarius_crypto import address_from_public_key
+
+    public_key = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return address_from_public_key(public_key)
 
 
 def csrf_token(response):
@@ -217,16 +229,7 @@ def test_console_workflow_and_restart_persist_real_state(services, tmp_path):
     assert network_page.status_code == 200
     admin_csrf = csrf_token(network_page)
 
-    wallet_response = administrator.post(
-        f"{console_url}/api/wallets/new",
-        data={"password": "wallet password"},
-        headers={"X-CSRF-Token": admin_csrf},
-        timeout=10,
-    )
-    assert wallet_response.status_code == 200
-    wallet = wallet_response.json()
-    assert wallet["wallet"]["address"] == wallet["address"]
-    miner_address = wallet["address"]
+    miner_address = new_denarius_address()
 
     miner_response = administrator.post(
         f"{console_url}/api/miner",
@@ -249,8 +252,33 @@ def test_console_workflow_and_restart_persist_real_state(services, tmp_path):
         timeout=5,
     )
     assert account_response.status_code == 200
-    assert int(account_response.json()["balance_atomic"]) > 0
+    assert int(account_response.json()["balance_atomic"]) == 0
+    assert int(account_response.json()["immature_balance_atomic"]) > 0
     assert requests.get(f"{node_url}/chain", timeout=3).json()["length"] == 2
+
+    automine_response = administrator.post(
+        f"{console_url}/api/automine",
+        data={"action": "start"},
+        headers={"X-CSRF-Token": admin_csrf},
+        timeout=5,
+    )
+    assert automine_response.status_code == 200
+    assert automine_response.json()["running"] is True
+    wait_for_response(
+        f"{node_url}/chain",
+        predicate=lambda response: (
+            response.status_code == 200 and response.json()["length"] >= 3
+        ),
+        timeout=10,
+    )
+    automine_response = administrator.post(
+        f"{console_url}/api/automine",
+        data={"action": "stop"},
+        headers={"X-CSRF-Token": admin_csrf},
+        timeout=5,
+    )
+    assert automine_response.status_code == 200
+    assert automine_response.json()["running"] is False
 
     console.stop()
     node.stop()
@@ -319,9 +347,7 @@ def test_two_real_nodes_synchronize_over_peer_protocol(services, tmp_path):
         second_environment,
     )
 
-    from denarius_crypto import generate_encrypted_wallet
-
-    miner_address = generate_encrypted_wallet("network test password")["address"]
+    miner_address = new_denarius_address()
     admin_headers = {"X-Denarius-Admin-Token": ADMIN_TOKEN}
     miner_response = requests.post(
         f"{first_url}/miner/register",

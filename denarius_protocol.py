@@ -3,9 +3,23 @@ import json
 from collections import OrderedDict
 
 
-PROTOCOL_VERSION = 2
-NETWORK_ID = 'denarius-mainnet-v2'
+PROTOCOL_VERSION = 3
+NETWORK_ID = 'denarius-testnet-v3'
+NETWORK_KIND = 'testnet'
+CONSENSUS_ALGORITHM = 'sha256-proof-of-work'
+GENESIS_MESSAGE = 'Denarius Testnet v3 | production foundations | 2026-07-20'
 COINBASE_SENDER = 'DENARIUS_COINBASE'
+
+# Consensus upgrades activate by block height. A release may understand future
+# rules before they become active, but must never infer activation from wall
+# clock time or local configuration.
+CONSENSUS_UPGRADES = (
+    {
+        'name': 'testnet-v3',
+        'activation_height': 0,
+        'protocol_version': PROTOCOL_VERSION,
+    },
+)
 
 # The peer API can evolve without changing consensus serialization.
 PEER_API_VERSION = 1
@@ -22,6 +36,8 @@ MAX_SUPPLY_ATOMIC = MAX_SUPPLY_DEN * ATOMIC_UNITS
 TARGET_BLOCK_SECONDS = 2 * 60
 HALVING_INTERVAL = 4 * 365 * 24 * 60 * 60 // TARGET_BLOCK_SECONDS
 INITIAL_BLOCK_REWARD = MAX_SUPPLY_ATOMIC // (2 * HALVING_INTERVAL)
+MIN_TRANSACTION_FEE_ATOMIC = 10_000
+COINBASE_MATURITY = 10
 
 RETARGET_TIMESPAN = 14 * 24 * 60 * 60
 RETARGET_INTERVAL = RETARGET_TIMESPAN // TARGET_BLOCK_SECONDS
@@ -29,7 +45,7 @@ MAX_FUTURE_BLOCK_SECONDS = 2 * 60 * 60
 MEDIAN_TIME_BLOCKS = 11
 
 MAX_HASH = (1 << 256) - 1
-INITIAL_TARGET = MAX_HASH >> 8
+INITIAL_TARGET = MAX_HASH >> 12
 MAX_TARGET = INITIAL_TARGET
 MIN_TARGET = 1
 
@@ -39,6 +55,7 @@ TRANSACTION_SIGNING_FIELDS = (
     'sender_address',
     'recipient_address',
     'amount_atomic',
+    'fee_atomic',
     'nonce',
 )
 SIGNED_TRANSACTION_FIELDS = TRANSACTION_SIGNING_FIELDS + (
@@ -109,11 +126,23 @@ def block_reward(height):
     return INITIAL_BLOCK_REWARD >> halvings
 
 
+def active_consensus_upgrade(height):
+    if not isinstance(height, int) or isinstance(height, bool) or height < 0:
+        raise ValueError('Block height must be a non-negative integer')
+    active = CONSENSUS_UPGRADES[0]
+    for upgrade in CONSENSUS_UPGRADES:
+        if upgrade['activation_height'] > height:
+            break
+        active = upgrade
+    return dict(active)
+
+
 def transaction_signing_payload(
     sender_address,
     recipient_address,
     amount_atomic,
     nonce,
+    fee_atomic=MIN_TRANSACTION_FEE_ATOMIC,
 ):
     return OrderedDict({
         'version': PROTOCOL_VERSION,
@@ -121,6 +150,7 @@ def transaction_signing_payload(
         'sender_address': sender_address,
         'recipient_address': recipient_address,
         'amount_atomic': str(amount_atomic),
+        'fee_atomic': str(fee_atomic),
         'nonce': nonce,
     })
 
@@ -185,10 +215,10 @@ GENESIS_BLOCK = {
     'version': PROTOCOL_VERSION,
     'network': NETWORK_ID,
     'block_number': 0,
-    'timestamp': 1546300800,
+    'timestamp': 1784505600,
     'merkle_root': EMPTY_MERKLE_ROOT,
     'nonce': 0,
-    'previous_hash': '00',
+    'previous_hash': sha256_hex(GENESIS_MESSAGE.encode('utf8')),
     'target': target_to_hex(INITIAL_TARGET),
     'transactions': [],
 }

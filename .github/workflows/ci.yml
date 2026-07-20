@@ -35,12 +35,18 @@ jobs:
             requirements.txt
             requirements-dev.txt
             pyproject.toml
+      - name: Set up Node.js for browser wallet tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Check dependency consistency
         run: python -m pip check
       - name: Run regression and integration tests
         run: python -m pytest
+      - name: Run browser wallet cryptography tests
+        run: node tests/wallet_crypto_test.mjs
 
   package:
     name: Build package
@@ -70,6 +76,7 @@ jobs:
           denarius --help
           denarius-node --help
           denarius-console --help
+          denarius-admin --help
           python -c "from importlib.resources import files; assert (files('blockchain_client') / 'templates' / 'base.html').is_file()"
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
@@ -78,15 +85,41 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  adversarial:
+    name: Adversarial verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run generated protocol properties
+        run: python -m pytest tests/test_properties.py -q
+      - name: Run long-chain benchmark gate
+        run: python benchmarks/long_chain.py --blocks 200
+      - name: Run synchronization soak
+        env:
+          DENARIUS_RUN_SOAK: "1"
+        run: python -m pytest tests/test_network_soak.py -q
+
   release-quality:
     name: Release quality
     if: always()
-    needs: [test, package]
+    needs: [test, package, adversarial]
     runs-on: ubuntu-latest
     steps:
       - name: Confirm required jobs passed
-        if: needs.test.result != 'success' || needs.package.result != 'success'
+        if: needs.test.result != 'success' || needs.package.result != 'success' || needs.adversarial.result != 'success'
         run: exit 1
       - name: Record successful result
-        if: needs.test.result == 'success' && needs.package.result == 'success'
+        if: needs.test.result == 'success' && needs.package.result == 'success' && needs.adversarial.result == 'success'
         run: echo "All release-quality checks passed."

@@ -25,9 +25,11 @@ def main(argv=None):
     parser.add_argument('--sync-interval', type=int, default=30)
     parser.add_argument('--node-host', default='127.0.0.1')
     parser.add_argument('--advertise-address', default=None)
+    parser.add_argument('--peer-scheme', choices=('http', 'https'), default='http')
+    parser.add_argument('--development-server', action='store_true')
     parser.add_argument(
         '--database',
-        default=str(state_path('denarius.db')),
+        default=str(state_path('denarius-testnet-v3.db')),
     )
     parser.add_argument(
         '--accounts-database',
@@ -50,6 +52,7 @@ def main(argv=None):
             '--database', args.database,
             '--sync-interval', str(args.sync_interval),
             '--host', args.node_host,
+            '--peer-scheme', args.peer_scheme,
             '--advertise-address', args.advertise_address or ('127.0.0.1:' + str(args.node_port)),
         ),
         command(
@@ -59,11 +62,14 @@ def main(argv=None):
             '--accounts-database', args.accounts_database,
         ),
     ]
+    if args.development_server:
+        services[0].append('--development-server')
+        services[1].append('--development-server')
     processes = [
         subprocess.Popen(service, cwd=str(PROJECT_ROOT), env=environment)
         for service in services
     ]
-    print('Denarius node:      http://127.0.0.1:' + str(args.node_port))
+    print('Denarius testnet:   http://127.0.0.1:' + str(args.node_port))
     print('Denarius Console:   http://127.0.0.1:' + str(args.console_port))
     if setup_token:
         print('Administrator setup code: ' + setup_token)

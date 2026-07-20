@@ -7,11 +7,16 @@
    to `CHANGELOG.md`.
 3. Confirm whether consensus, network, peer API, database, or wallet formats
    changed and document any migration or reset requirement.
-4. Install the pinned development environment with
+4. Confirm the release still identifies itself as a testnet. Creating or naming
+   a mainnet requires every launch gate in `docs/THREAT_MODEL.md` and an
+   independently reviewed production genesis procedure.
+5. Install the pinned development environment with
    `python -m pip install -r requirements-dev.txt`.
-5. Run `python -m pytest` and `python -m build`.
-6. Install the wheel from `dist` in a clean virtual environment and run
-   `denarius --help`, `denarius-node --help`, and `denarius-console --help`.
+6. Run `python -m pytest`, `python benchmarks/long_chain.py --blocks 1000`,
+   and `python -m build`.
+7. Install the wheel from `dist` in a clean virtual environment and run
+   `denarius --help`, `denarius-node --help`, `denarius-console --help`, and
+   `denarius-admin --help`.
 
 ## Publish the release
 

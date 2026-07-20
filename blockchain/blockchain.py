@@ -1,6 +1,7 @@
 import binascii
 import copy
 import hmac
+import ipaddress
 import os
 import sys
 import threading
@@ -15,8 +16,7 @@ from uuid import uuid1
 import requests
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from flask import Flask, Response, jsonify, request
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,6 +26,7 @@ from denarius_protocol import (
     ATOMIC_UNITS,
     BLOCK_FIELDS,
     BLOCK_HEADER_FIELDS,
+    COINBASE_MATURITY,
     COINBASE_FIELDS,
     COINBASE_SENDER,
     GENESIS_BLOCK,
@@ -37,6 +38,7 @@ from denarius_protocol import (
     MAX_SUPPLY_ATOMIC,
     MAX_TARGET,
     MEDIAN_TIME_BLOCKS,
+    MIN_TRANSACTION_FEE_ATOMIC,
     NETWORK_ID,
     PEER_API_VERSION,
     PROTOCOL_VERSION,
@@ -56,7 +58,13 @@ from denarius_protocol import (
     work_for_target,
 )
 from denarius_crypto import address_from_public_key, public_key_from_address
+from denarius_ledger import ChainState
 from denarius_network import PeerNetwork, protocol_identity
+from denarius_operations import (
+    configure_json_logging,
+    configure_trusted_proxy,
+    install_runtime_controls,
+)
 from denarius_paths import state_path
 from denarius_storage import DenariusStorage, migrate_json_state
 
@@ -70,13 +78,18 @@ class Blockchain:
     COINBASE_SENDER = COINBASE_SENDER
     PEER_REQUEST_TIMEOUT = 3
     MAX_PEERS = 128
+    MAX_DISCOVERED_PER_PEER = 8
+    MAX_PEERS_PER_NETWORK_GROUP = 4
     MAX_HEADERS_PER_REQUEST = 512
     MAX_BLOCKS_PER_REQUEST = 32
+    MAX_CHAIN_API_BLOCKS = 250
     MAX_SYNC_HEADERS = 100000
     MAX_PENDING_TRANSACTIONS = 1000
+    MAX_PENDING_PER_SENDER = 64
     MAX_TRANSACTIONS_PER_BLOCK = 1000
+    AUTOMINE_INTERVAL_SECONDS = 2
     GENESIS_BLOCK = GENESIS_BLOCK
-    STATE_PATH = state_path('denarius.db')
+    STATE_PATH = state_path('denarius-testnet-v3.db')
 
     def __init__(self, name="THE BLOCKCHAIN"):
 
@@ -85,8 +98,15 @@ class Blockchain:
         self._sync_stop = threading.Event()
         self._sync_wakeup = threading.Event()
         self._sync_thread = None
+        self._automine_stop = threading.Event()
+        self._automine_thread = None
+        self._automine_started_at = None
+        self._automine_blocks_mined = 0
+        self._automine_last_block = None
+        self._automine_last_error = None
         self.transactions = []
         self.chain = []
+        self.undo_records = {}
         self.nodes = set()
         self.advertised_node = None
         self.network = PeerNetwork(
@@ -97,6 +117,7 @@ class Blockchain:
         self.node_address = str(uuid1()).replace('-', '')
         # Create genesis block
         self.chain.append(dict(self.GENESIS_BLOCK))
+        self.chain_state = ChainState()
         self.miner_name = name
         self.MINING_TARGET = INITIAL_TARGET
 
@@ -188,9 +209,9 @@ class Blockchain:
         if not node_url or len(node_url) > 255:
             raise ValueError('Invalid URL')
 
-        candidate = node_url if '://' in node_url else 'http://' + node_url
+        candidate = node_url if '://' in node_url else self.network.scheme + '://' + node_url
         parsed_url = urlparse(candidate)
-        if parsed_url.scheme != 'http' or parsed_url.username or parsed_url.password:
+        if parsed_url.scheme != self.network.scheme or parsed_url.username or parsed_url.password:
             raise ValueError('Invalid URL')
         if parsed_url.path not in ('', '/') or parsed_url.query or parsed_url.fragment:
             raise ValueError('Invalid URL')
@@ -211,17 +232,64 @@ class Blockchain:
     def peer_url(self, node, path):
         return self.network.peer_url(node, path)
 
-    def register_node(self, node_url):
+    def peer_host(self, node):
+        parsed = urlparse('http://' + node)
+        return parsed.hostname
+
+    def peer_network_group(self, node):
+        hostname = self.peer_host(node)
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            labels = hostname.lower().rstrip('.').split('.')
+            return 'dns:' + '.'.join(labels[-2:])
+        if address.is_loopback:
+            return 'loopback'
+        if address.version == 4:
+            network = ipaddress.ip_network(str(address) + '/16', strict=False)
+            return 'ipv4:' + str(network.network_address) + '/16'
+        network = ipaddress.ip_network(str(address) + '/32', strict=False)
+        return 'ipv6:' + str(network.network_address) + '/32'
+
+    def validate_discovered_peer(self, peer, source):
+        candidate_host = self.peer_host(peer)
+        source_host = self.peer_host(source)
+        try:
+            candidate_address = ipaddress.ip_address(candidate_host)
+            source_address = ipaddress.ip_address(source_host)
+        except ValueError as exc:
+            raise ValueError('Peer gossip may only advertise IP addresses') from exc
+        if (
+            not source_address.is_private
+            and not source_address.is_loopback
+            and (candidate_address.is_private or candidate_address.is_loopback)
+        ):
+            raise ValueError('Public peers may not advertise private network addresses')
+
+        group = self.peer_network_group(peer)
+        with self._lock:
+            group_count = sum(
+                self.peer_network_group(existing) == group
+                for existing in self.nodes
+            )
+        if group_count >= self.MAX_PEERS_PER_NETWORK_GROUP:
+            raise ValueError('Peer network group limit reached')
+
+    def register_node(self, node_url, discovered_from=None):
         """
         Add a new node to the list of nodes
         """
         normalized_node = self.normalize_node(node_url)
+        if discovered_from is not None:
+            self.validate_discovered_peer(normalized_node, discovered_from)
         with self._lock:
             if normalized_node == self.advertised_node:
                 raise ValueError('Cannot register the current node as a peer')
             if len(self.nodes) >= self.MAX_PEERS and normalized_node not in self.nodes:
                 raise ValueError('Peer limit reached')
+            before = len(self.nodes)
             self.nodes.add(normalized_node)
+            return len(self.nodes) > before
 
     def exchange_peer_table(self):
         with self._lock:
@@ -233,11 +301,13 @@ class Blockchain:
                 continue
             discovered = payload.get('nodes')
             if not isinstance(discovered, list):
-                self.network.health.record_failure(node, 'Peer returned an invalid peer table')
+                self.network.health.record_misbehavior(node, 'Peer returned an invalid peer table')
                 continue
-            for peer in discovered:
+            if len(discovered) > self.MAX_PEERS:
+                self.network.health.record_misbehavior(node, 'Peer advertised an oversized peer table')
+            for peer in discovered[:self.MAX_DISCOVERED_PER_PEER]:
                 try:
-                    self.register_node(peer)
+                    self.register_node(peer, discovered_from=node)
                 except ValueError:
                     continue
                 with self._lock:
@@ -283,16 +353,17 @@ class Blockchain:
 
     def protocol_status(self):
         with self._lock:
-            chain = copy.deepcopy(self.chain)
+            self.ensure_chain_state()
+            height = len(self.chain) - 1
+            tip_hash = self.hash(self.chain[-1])
+            chainwork = self.chain_state.chainwork
         status = protocol_identity()
         status.update({
             'node': self.advertised_node,
-            'height': len(chain) - 1,
-            'tip_hash': self.hash(chain[-1]),
-            'chainwork': str(sum(
-                work_for_target(target_from_hex(block['target']))
-                for block in chain[1:]
-            )),
+            'peer_transport': self.network.scheme,
+            'height': height,
+            'tip_hash': tip_hash,
+            'chainwork': str(chainwork),
         })
         return status
 
@@ -322,57 +393,34 @@ class Blockchain:
             return False
 
     def get_balance(self, address):
-        """
-        Get the balance noted on the address
-        :param address: the address of the account
-        :return: balance (Float)
-        """
-        balance = 0
-        with self._lock:
-            chain = copy.deepcopy(self.chain)
-        for c in chain:
-            for t in c['transactions']:
-                if t['sender_address'] == address and t['recipient_address'] == address:
-                    continue
-                if t['recipient_address'] == address:
-                    balance += self.parse_atomic_value(t['amount_atomic']) or 0
-                elif t['sender_address'] == address:
-                    balance -= self.parse_atomic_value(t['amount_atomic']) or 0
-        return self.format_amount(balance)
+        return self.format_amount(self.get_atomic_balance(address))
 
     def get_atomic_balance(self, address, include_pending=False):
-        balance = 0
         with self._lock:
-            chain = copy.deepcopy(self.chain)
-            pending_transactions = copy.deepcopy(self.transactions) if include_pending else []
-
-        for c in chain:
-            for t in c['transactions']:
-                atomic_value = self.parse_atomic_value(t['amount_atomic']) or 0
-                if t['sender_address'] == address and t['recipient_address'] == address:
-                    continue
-                if t['recipient_address'] == address:
-                    balance += atomic_value
-                if t['sender_address'] == address:
-                    balance -= atomic_value
-
-        if include_pending:
-            for t in pending_transactions:
-                atomic_value = self.parse_atomic_value(t['amount_atomic']) or 0
-                if t['sender_address'] == address and t['recipient_address'] == address:
-                    continue
-                if t['sender_address'] == address:
-                    balance -= atomic_value
+            self.ensure_chain_state()
+            balance = self.chain_state.balances.get(address, 0)
+            if include_pending:
+                for transaction in self.transactions:
+                    if transaction.get('sender_address') == address:
+                        balance -= (
+                            self.parse_atomic_value(transaction.get('amount_atomic')) or 0
+                        ) + (
+                            self.parse_atomic_value(transaction.get('fee_atomic')) or 0
+                        )
         return balance
 
+    def get_immature_balance(self, address):
+        with self._lock:
+            self.ensure_chain_state()
+            return self.chain_state.immature_balance(address)
+
     def get_confirmed_nonce(self, address, chain=None):
-        nonce = 0
-        blocks = chain if chain is not None else self.chain
-        for block in blocks:
-            for transaction in block.get('transactions', []):
-                if transaction.get('sender_address') == address:
-                    nonce += 1
-        return nonce
+        if chain is not None and chain is not self.chain:
+            state = self.build_chain_state(chain)
+            return 0 if state is None else state.nonces.get(address, 0)
+        with self._lock:
+            self.ensure_chain_state()
+            return self.chain_state.nonces.get(address, 0)
 
     def get_next_nonce(self, address):
         with self._lock:
@@ -390,21 +438,21 @@ class Blockchain:
         return transaction_id
 
     def confirmed_transaction_keys(self, chain=None):
-        transaction_keys = set()
-        for block in chain if chain is not None else self.chain:
-            for transaction in block.get('transactions', []):
-                if transaction.get('sender_address') != self.COINBASE_SENDER:
-                    transaction_keys.add(self.transaction_key(transaction))
-        return transaction_keys
+        if chain is not None and chain is not self.chain:
+            state = self.build_chain_state(chain)
+            return set() if state is None else set(state.confirmed_transactions)
+        with self._lock:
+            self.ensure_chain_state()
+            return set(self.chain_state.confirmed_transactions)
 
-    def verify_enough_balance(self, address, atomic_value):
+    def verify_enough_balance(self, address, atomic_value, fee_atomic=0):
         """
         Check that the sender has enough balance in his wallet.
         :param sender_address: address of the sender
         :param value: value to be sent
         :return: True if sender has enough balance else False
         """
-        return self.get_atomic_balance(address, include_pending=True) >= atomic_value
+        return self.get_atomic_balance(address, include_pending=True) >= atomic_value + fee_atomic
 
     def submit_transaction(
         self,
@@ -414,6 +462,7 @@ class Blockchain:
         nonce,
         signature,
         transaction_id,
+        fee=MIN_TRANSACTION_FEE_ATOMIC,
         relay=True,
     ):
         """
@@ -421,6 +470,11 @@ class Blockchain:
         """
         atomic_value = self.parse_atomic_value(value)
         if atomic_value is None:
+            return False
+        fee_atomic = self.parse_atomic_value(fee)
+        if fee_atomic is None or fee_atomic < MIN_TRANSACTION_FEE_ATOMIC:
+            return False
+        if atomic_value + fee_atomic > self.TOTAL_AMOUNT:
             return False
 
         try:
@@ -435,6 +489,7 @@ class Blockchain:
             recipient_address,
             atomic_value,
             nonce,
+            fee_atomic,
         )
 
         if sender_address == self.COINBASE_SENDER:
@@ -457,11 +512,19 @@ class Blockchain:
         signed_transaction['transaction_id'] = expected_transaction_id
 
         with self._lock:
+            self.ensure_chain_state()
             if len(self.transactions) >= self.MAX_PENDING_TRANSACTIONS:
+                return False
+            sender_pending = [
+                pending
+                for pending in self.transactions
+                if pending.get('sender_address') == sender_address
+            ]
+            if len(sender_pending) >= self.MAX_PENDING_PER_SENDER:
                 return False
             if nonce != self.get_next_nonce(sender_address):
                 return False
-            if not self.verify_enough_balance(sender_address, atomic_value):
+            if not self.verify_enough_balance(sender_address, atomic_value, fee_atomic):
                 return False
 
             transaction_key = self.transaction_key(signed_transaction)
@@ -478,10 +541,14 @@ class Blockchain:
             self.broadcast_transaction(signed_transaction)
         return next_block_number
 
-    def create_coinbase_transaction(self, height=None, recipient_address=None):
+    def create_coinbase_transaction(self, height=None, recipient_address=None, fees_atomic=0):
         height = len(self.chain) if height is None else height
         recipient_address = self.node_address if recipient_address is None else recipient_address
-        return coinbase_transaction(recipient_address, self.block_reward(height), height)
+        return coinbase_transaction(
+            recipient_address,
+            self.block_reward(height) + fees_atomic,
+            height,
+        )
 
     def create_candidate_block(self):
         with self._lock:
@@ -493,7 +560,11 @@ class Blockchain:
             target = self.expected_target(self.chain, height)
             timestamp = max(int(time()), self.median_time_past(self.chain) + 1)
 
-        coinbase = self.create_coinbase_transaction(height, recipient_address)
+        fees_atomic = sum(
+            self.parse_atomic_value(transaction.get('fee_atomic')) or 0
+            for transaction in pending_snapshot
+        )
+        coinbase = self.create_coinbase_transaction(height, recipient_address, fees_atomic)
         transactions = [coinbase] + pending_snapshot
         block = {
             'version': self.PROTOCOL_VERSION,
@@ -514,7 +585,7 @@ class Blockchain:
         """
         return block_hash(block)
 
-    def proof_of_work(self, candidate_block):
+    def proof_of_work(self, candidate_block, stop_event=None):
         """
         Find a nonce for a complete candidate block. Every consensus field,
         including the coinbase reward, is committed by the proof.
@@ -539,7 +610,11 @@ class Blockchain:
         block = copy.deepcopy(candidate_block)
         nonce = 0
         block['nonce'] = nonce
+        if stop_event is not None and stop_event.is_set():
+            return None
         while not self.valid_proof(block):
+            if stop_event is not None and stop_event.is_set():
+                return None
             nonce += 1
             block['nonce'] = nonce
         return block
@@ -563,6 +638,9 @@ class Blockchain:
 
             if set(transaction) != set(SIGNED_TRANSACTION_FIELDS):
                 return False
+            fee_atomic = self.parse_atomic_value(transaction.get('fee_atomic'))
+            if fee_atomic is None or fee_atomic < MIN_TRANSACTION_FEE_ATOMIC:
+                return False
             nonce = transaction.get('nonce')
             if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
                 return False
@@ -571,6 +649,7 @@ class Blockchain:
                 transaction.get('recipient_address'),
                 atomic_value,
                 nonce,
+                fee_atomic,
             )
             if any(transaction.get(field) != value for field, value in payload.items()):
                 return False
@@ -596,32 +675,100 @@ class Blockchain:
             return False
         return int(proof_hash, 16) <= target
 
-    def mine_pending_transactions(self, relay=True, persist=True):
+    def mine_pending_transactions(self, relay=True, persist=True, stop_event=None):
         if self.public_key_from_address(self.node_address) is None:
             return False
 
         candidate = self.create_candidate_block()
-        block = self.proof_of_work(candidate)
+        block = self.proof_of_work(candidate, stop_event=stop_event)
+        if block is None:
+            return False
+        if stop_event is not None and stop_event.is_set():
+            return False
 
         with self._lock:
+            self.ensure_chain_state()
             if block['block_number'] != len(self.chain):
                 return False
             if block['previous_hash'] != self.hash(self.chain[-1]):
                 return False
 
-            candidate_chain = self.chain + [block]
-            if not self.valid_chain(candidate_chain):
+            height = len(self.chain)
+            undo = self.create_block_undo(self.chain_state, block, height)
+            next_state = self.validate_next_block(block, self.chain, self.chain_state)
+            if next_state is None:
                 return False
 
             self.chain.append(block)
+            self.chain_state = next_state
+            self.undo_records[height] = undo
             self.remove_confirmed_transactions(block)
             self.update_hyperparameters()
             if persist:
-                self.save_everything()
+                self.persist_appended_block(block, undo)
 
         if relay:
             self.broadcast_block(block)
         return block
+
+    def automining_status(self):
+        with self._lock:
+            running = self._automine_thread is not None and self._automine_thread.is_alive()
+            return {
+                'running': running,
+                'interval_seconds': self.AUTOMINE_INTERVAL_SECONDS,
+                'started_at': self._automine_started_at,
+                'blocks_mined': self._automine_blocks_mined,
+                'last_block': self._automine_last_block,
+                'last_error': self._automine_last_error,
+            }
+
+    def start_automining(self):
+        if self.public_key_from_address(self.node_address) is None:
+            return False
+        with self._lock:
+            if self._automine_thread is not None and self._automine_thread.is_alive():
+                return self.automining_status()
+            self._automine_stop.clear()
+            self._automine_started_at = int(time())
+            self._automine_blocks_mined = 0
+            self._automine_last_block = None
+            self._automine_last_error = None
+
+            def worker():
+                while not self._automine_stop.is_set():
+                    try:
+                        block = self.mine_pending_transactions(
+                            stop_event=self._automine_stop,
+                        )
+                    except Exception as exc:
+                        with self._lock:
+                            self._automine_last_error = str(exc)[:240]
+                        if self._automine_stop.wait(self.AUTOMINE_INTERVAL_SECONDS):
+                            break
+                        continue
+                    if block is not False:
+                        with self._lock:
+                            self._automine_blocks_mined += 1
+                            self._automine_last_block = block['block_number']
+                            self._automine_last_error = None
+                    if self._automine_stop.wait(self.AUTOMINE_INTERVAL_SECONDS):
+                        break
+
+            self._automine_thread = threading.Thread(
+                target=worker,
+                name='denarius-autominer',
+                daemon=True,
+            )
+            self._automine_thread.start()
+            return self.automining_status()
+
+    def stop_automining(self):
+        self._automine_stop.set()
+        thread = self._automine_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(5, self.PEER_REQUEST_TIMEOUT + 1))
+        return self.automining_status()
 
     def apply_transaction(self, transaction, ledger, nonces=None, require_signature=True):
         if not isinstance(transaction, dict):
@@ -631,6 +778,11 @@ class Blockchain:
 
         atomic_value = self.parse_atomic_value(transaction.get('amount_atomic'))
         if atomic_value is None:
+            return False
+        fee_atomic = self.parse_atomic_value(transaction.get('fee_atomic'))
+        if fee_atomic is None or fee_atomic < MIN_TRANSACTION_FEE_ATOMIC:
+            return False
+        if atomic_value + fee_atomic > self.TOTAL_AMOUNT:
             return False
 
         sender_address = transaction.get('sender_address')
@@ -648,6 +800,7 @@ class Blockchain:
             recipient_address,
             atomic_value,
             nonce,
+            fee_atomic,
         )
         if any(transaction.get(field) != value for field, value in normalized_transaction.items()):
             return False
@@ -666,15 +819,15 @@ class Blockchain:
         nonces = {} if nonces is None else nonces
         if nonce != nonces.get(sender_address, 0):
             return False
-        if ledger.get(sender_address, 0) < atomic_value:
+        if ledger.get(sender_address, 0) < atomic_value + fee_atomic:
             return False
 
-        ledger[sender_address] = ledger.get(sender_address, 0) - atomic_value
+        ledger[sender_address] = ledger.get(sender_address, 0) - atomic_value - fee_atomic
         ledger[recipient_address] = ledger.get(recipient_address, 0) + atomic_value
         nonces[sender_address] = nonce + 1
         return True
 
-    def apply_coinbase_transaction(self, transaction, ledger, height):
+    def apply_coinbase_transaction(self, transaction, state, height, fees_atomic):
         if not isinstance(transaction, dict):
             return False
         if set(transaction) != set(COINBASE_FIELDS):
@@ -686,7 +839,8 @@ class Blockchain:
 
         if transaction.get('sender_address') != self.COINBASE_SENDER:
             return False
-        if atomic_value != self.block_reward(height):
+        subsidy = self.block_reward(height)
+        if atomic_value != subsidy + fees_atomic:
             return False
 
         recipient_address = transaction.get('recipient_address')
@@ -696,79 +850,193 @@ class Blockchain:
         if transaction != coinbase_transaction(recipient_address, atomic_value, height):
             return False
 
-        ledger[recipient_address] = ledger.get(recipient_address, 0) + atomic_value
-        if sum(ledger.values()) > self.TOTAL_AMOUNT:
+        state.issued_atomic += subsidy
+        if state.issued_atomic > self.TOTAL_AMOUNT:
             return False
+        state.immature_rewards.append({
+            'height': height,
+            'matures_at': height + COINBASE_MATURITY,
+            'address': recipient_address,
+            'amount_atomic': atomic_value,
+        })
         return True
+
+    def state_matches_chain(self):
+        return (
+            self.chain_state.tip_height == len(self.chain) - 1
+            and self.chain_state.tip_hash == self.hash(self.chain[-1])
+        )
+
+    def ensure_chain_state(self):
+        if self.state_matches_chain():
+            return self.chain_state
+        rebuilt = self.build_chain_state(self.chain)
+        if rebuilt is None:
+            raise ValueError('Current chain cannot produce a valid chain state')
+        self.chain_state = rebuilt
+        return rebuilt
+
+    def validate_next_block(self, block, chain, state):
+        height = len(chain)
+        if not isinstance(block, dict) or set(block) != set(BLOCK_FIELDS):
+            return None
+        if block.get('version') != self.PROTOCOL_VERSION or block.get('network') != self.NETWORK_ID:
+            return None
+        if block.get('block_number') != height:
+            return None
+        if not isinstance(block.get('nonce'), int) or isinstance(block.get('nonce'), bool):
+            return None
+        if block['nonce'] < 0:
+            return None
+        if not isinstance(block.get('timestamp'), int) or isinstance(block.get('timestamp'), bool):
+            return None
+        if block['timestamp'] <= self.median_time_past(chain):
+            return None
+        if block['timestamp'] > int(time()) + MAX_FUTURE_BLOCK_SECONDS:
+            return None
+        if block.get('previous_hash') != self.hash(chain[-1]):
+            return None
+        try:
+            expected_target = target_to_hex(self.expected_target(chain, height))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if block.get('target') != expected_target:
+            return None
+
+        transactions = block.get('transactions')
+        if not isinstance(transactions, list) or not transactions:
+            return None
+        if len(transactions) > self.MAX_TRANSACTIONS_PER_BLOCK:
+            return None
+        if not self.valid_proof(block):
+            return None
+
+        working = state.clone()
+        working.mature_rewards(height)
+        fees_atomic = 0
+        for transaction in transactions[1:]:
+            if not isinstance(transaction, dict):
+                return None
+            try:
+                transaction_key = self.transaction_key(transaction)
+            except ValueError:
+                return None
+            if transaction_key in working.confirmed_transactions:
+                return None
+            if not self.apply_transaction(
+                transaction,
+                working.balances,
+                working.nonces,
+                require_signature=True,
+            ):
+                return None
+            working.confirmed_transactions.add(transaction_key)
+            working.transaction_heights[transaction_key] = height
+            fees_atomic += self.parse_atomic_value(transaction.get('fee_atomic')) or 0
+
+        if not self.apply_coinbase_transaction(
+            transactions[0],
+            working,
+            height,
+            fees_atomic,
+        ):
+            return None
+
+        working.chainwork += work_for_target(target_from_hex(block['target']))
+        working.tip_height = height
+        working.tip_hash = self.hash(block)
+        return working
+
+    def create_block_undo(self, state, block, height=None):
+        height = len(self.chain) if height is None else height
+        touched_addresses = {
+            reward['address']
+            for reward in state.immature_rewards
+            if reward['matures_at'] <= height
+        }
+        touched_nonces = set()
+        added_transactions = []
+        for transaction in block.get('transactions', [])[1:]:
+            sender = transaction.get('sender_address')
+            recipient = transaction.get('recipient_address')
+            if sender:
+                touched_addresses.add(sender)
+                touched_nonces.add(sender)
+            if recipient:
+                touched_addresses.add(recipient)
+            transaction_id = transaction.get('transaction_id')
+            if transaction_id:
+                added_transactions.append(transaction_id)
+        return {
+            'height': height,
+            'block_hash': self.hash(block),
+            'balances_before': {
+                address: state.balances.get(address)
+                for address in sorted(touched_addresses)
+            },
+            'nonces_before': {
+                address: state.nonces.get(address)
+                for address in sorted(touched_nonces)
+            },
+            'confirmed_transactions_added': added_transactions,
+            'immature_rewards_before': copy.deepcopy(state.immature_rewards),
+            'issued_atomic_before': state.issued_atomic,
+            'chainwork_before': str(state.chainwork),
+            'tip_height_before': state.tip_height,
+            'tip_hash_before': state.tip_hash,
+        }
+
+    def restore_block_undo(self, state, undo):
+        restored = state.clone()
+        for address, previous in undo['balances_before'].items():
+            if previous is None:
+                restored.balances.pop(address, None)
+            else:
+                restored.balances[address] = previous
+        for address, previous in undo['nonces_before'].items():
+            if previous is None:
+                restored.nonces.pop(address, None)
+            else:
+                restored.nonces[address] = previous
+        for transaction_id in undo['confirmed_transactions_added']:
+            restored.confirmed_transactions.discard(transaction_id)
+            restored.transaction_heights.pop(transaction_id, None)
+        restored.immature_rewards = copy.deepcopy(undo['immature_rewards_before'])
+        restored.issued_atomic = int(undo['issued_atomic_before'])
+        restored.chainwork = int(undo['chainwork_before'])
+        restored.tip_height = int(undo['tip_height_before'])
+        restored.tip_hash = undo['tip_hash_before']
+        return restored
+
+    def replay_chain(self, chain):
+        if not isinstance(chain, list) or not chain or chain[0] != self.GENESIS_BLOCK:
+            return None, None
+        state = ChainState()
+        undo_records = {}
+        history = [chain[0]]
+        for block in chain[1:]:
+            undo = self.create_block_undo(state, block, len(history))
+            state = self.validate_next_block(block, history, state)
+            if state is None:
+                return None, None
+            undo_records[len(history)] = undo
+            history.append(block)
+        return state, undo_records
+
+    def build_chain_state(self, chain):
+        state, _ = self.replay_chain(chain)
+        return state
 
     def valid_chain(self, chain):
-        """
-        check if a blockchain is valid
-        """
-        if not isinstance(chain, list) or not chain or chain[0] != self.GENESIS_BLOCK:
-            return False
-
-        ledger = {}
-        nonces = {}
-        seen_transactions = set()
-        last_block = chain[0]
-        current_index = 1
-
-        while current_index < len(chain):
-            block = chain[current_index]
-            if not isinstance(block, dict) or set(block) != set(BLOCK_FIELDS):
-                return False
-            if block.get('version') != self.PROTOCOL_VERSION or block.get('network') != self.NETWORK_ID:
-                return False
-            if block['block_number'] != current_index:
-                return False
-            if not isinstance(block['nonce'], int) or isinstance(block['nonce'], bool) or block['nonce'] < 0:
-                return False
-            if not isinstance(block['timestamp'], int) or isinstance(block['timestamp'], bool):
-                return False
-            if block['timestamp'] <= self.median_time_past(chain[:current_index]):
-                return False
-            if block['timestamp'] > int(time()) + MAX_FUTURE_BLOCK_SECONDS:
-                return False
-            if block['previous_hash'] != self.hash(last_block):
-                return False
-            try:
-                if block['target'] != target_to_hex(self.expected_target(chain[:current_index], current_index)):
-                    return False
-            except (KeyError, TypeError, ValueError):
-                return False
-            if not isinstance(block['transactions'], list) or not block['transactions']:
-                return False
-            if len(block['transactions']) > self.MAX_TRANSACTIONS_PER_BLOCK:
-                return False
-            if not self.valid_proof(block):
-                return False
-
-            coinbase = block['transactions'][0]
-            transactions = block['transactions'][1:]
-
-            for transaction in transactions:
-                if not isinstance(transaction, dict):
-                    return False
-                transaction_key = self.transaction_key(transaction)
-                if transaction_key in seen_transactions:
-                    return False
-                seen_transactions.add(transaction_key)
-                if not self.apply_transaction(transaction, ledger, nonces, require_signature=True):
-                    return False
-
-            if not self.apply_coinbase_transaction(coinbase, ledger, current_index):
-                return False
-
-            last_block = block
-            current_index += 1
-
-        return True
+        return self.build_chain_state(chain) is not None
 
     def chainwork(self, chain):
-        if not self.valid_chain(chain):
-            return 0
-        return sum(work_for_target(target_from_hex(block['target'])) for block in chain[1:])
+        if chain is self.chain:
+            with self._lock:
+                self.ensure_chain_state()
+                return self.chain_state.chainwork
+        state = self.build_chain_state(chain)
+        return 0 if state is None else state.chainwork
 
     def headers_for_chain(self, chain=None):
         blocks = self.chain if chain is None else chain
@@ -980,19 +1248,24 @@ class Blockchain:
         if not isinstance(block, dict):
             return False
         with self._lock:
+            self.ensure_chain_state()
             if block.get('block_number') != len(self.chain):
                 return False
             if block.get('previous_hash') != self.hash(self.chain[-1]):
                 return False
 
-            candidate_chain = self.chain + [block]
-            if not self.valid_chain(candidate_chain):
+            height = len(self.chain)
+            undo = self.create_block_undo(self.chain_state, block, height)
+            next_state = self.validate_next_block(block, self.chain, self.chain_state)
+            if next_state is None:
                 return False
 
             self.chain.append(copy.deepcopy(block))
+            self.chain_state = next_state
+            self.undo_records[height] = undo
             self.remove_confirmed_transactions(block)
             self.update_hyperparameters()
-            self.save_everything()
+            self.persist_appended_block(block, undo)
 
         self.network.seen_blocks.add(self.hash(block))
         if relay:
@@ -1032,12 +1305,14 @@ class Blockchain:
         if suffix is None:
             return False
         candidate_chain = local_chain[:best_common_height + 1] + suffix
-        if not self.valid_chain(candidate_chain):
+        candidate_state, candidate_undo = self.replay_chain(candidate_chain)
+        if candidate_state is None:
             self.network.health.record_failure(best_peer, 'Peer block data did not match its valid headers')
             return False
 
         with self._lock:
-            if self.chainwork(candidate_chain) <= self.chainwork(self.chain):
+            self.ensure_chain_state()
+            if candidate_state.chainwork <= self.chain_state.chainwork:
                 return False
             current_chain = copy.deepcopy(self.chain)
             pending_transactions = copy.deepcopy(self.transactions)
@@ -1054,6 +1329,8 @@ class Blockchain:
                 disconnected_transactions.extend(block.get('transactions', [])[1:])
 
             self.chain = copy.deepcopy(candidate_chain)
+            self.chain_state = candidate_state
+            self.undo_records = candidate_undo
             self.transactions = []
             for transaction in disconnected_transactions + pending_transactions:
                 self.submit_transaction(
@@ -1063,6 +1340,7 @@ class Blockchain:
                     transaction.get('nonce'),
                     transaction.get('signature'),
                     transaction.get('transaction_id'),
+                    fee=transaction.get('fee_atomic'),
                     relay=False,
                 )
             self.MINING_TARGET = self.expected_target(self.chain, len(self.chain))
@@ -1078,8 +1356,8 @@ class Blockchain:
         try:
             added_peers = self.exchange_peer_table()
             replaced = self.resolve_conflicts()
-            if added_peers and not replaced:
-                self.save_everything()
+            if added_peers or not replaced:
+                self.persist_peer_state()
             self.last_sync_at = int(time())
             self.last_sync_error = None
             return replaced
@@ -1118,6 +1396,11 @@ class Blockchain:
     def stop_background_sync(self):
         self._sync_stop.set()
         self._sync_wakeup.set()
+        thread = self._sync_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(5, self.PEER_REQUEST_TIMEOUT + 1))
+            if not thread.is_alive():
+                self._sync_thread = None
 
     def synchronization_status(self):
         return {
@@ -1130,24 +1413,107 @@ class Blockchain:
 
     def save_everything(self):
         with self._lock:
+            self.ensure_chain_state()
             state = {
                 'chain': copy.deepcopy(self.chain),
+                'chain_state': self.chain_state.as_dict(),
+                'undo_records': copy.deepcopy(self.undo_records),
                 'transactions': copy.deepcopy(self.transactions),
                 'nodes': sorted(self.nodes),
+                'peer_states': self.network.health.export_state(self.nodes),
                 'node_address': self.node_address,
                 'miner_name': self.miner_name,
                 'mining_target': target_to_hex(self.MINING_TARGET),
             }
         DenariusStorage(self.STATE_PATH).save_state(state)
 
+    def persist_peer_state(self):
+        storage = DenariusStorage(self.STATE_PATH)
+        if not storage.path.exists():
+            self.save_everything()
+            return
+        with self._lock:
+            nodes = sorted(self.nodes)
+            peer_states = self.network.health.export_state(nodes)
+        storage.update_peers(nodes, peer_states)
 
-    def load_everything(self, path):
+    def persist_appended_block(self, block, undo):
+        storage = DenariusStorage(self.STATE_PATH)
+        if not storage.path.exists():
+            self.save_everything()
+            return
+        state = {
+            'chain_state': self.chain_state.as_dict(),
+            'transactions': copy.deepcopy(self.transactions),
+            'nodes': sorted(self.nodes),
+            'node_address': self.node_address,
+            'miner_name': self.miner_name,
+            'mining_target': target_to_hex(self.MINING_TARGET),
+        }
+        storage.append_block(state, block, undo)
+
+
+    def load_persisted_chain_state(self, chain, persisted_chain_state, undo_records):
+        if not isinstance(chain, list) or not chain or chain[0] != self.GENESIS_BLOCK:
+            raise ValueError('State database has an invalid genesis block')
+        try:
+            chain_state = ChainState.from_dict(persisted_chain_state)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('State database chain index is invalid') from exc
+        if chain_state.tip_height != len(chain) - 1:
+            raise ValueError('State database chain index has an invalid height')
+        if chain_state.tip_hash != self.hash(chain[-1]):
+            raise ValueError('State database chain index has an invalid tip')
+        if chain_state.issued_atomic < 0 or chain_state.issued_atomic > self.TOTAL_AMOUNT:
+            raise ValueError('State database chain index has invalid issuance')
+        if any(balance < 0 for balance in chain_state.balances.values()):
+            raise ValueError('State database chain index has a negative balance')
+        if any(nonce < 0 for nonce in chain_state.nonces.values()):
+            raise ValueError('State database chain index has a negative nonce')
+        expected_undo_heights = set(range(1, len(chain)))
+        if set(undo_records) != expected_undo_heights:
+            raise ValueError('State database reorganization undo index is incomplete')
+
+        if len(chain) == 1:
+            if chain_state.as_dict() != ChainState().as_dict():
+                raise ValueError('State database genesis index is invalid')
+            return chain_state
+
+        height = len(chain) - 1
+        undo = undo_records[height]
+        if undo.get('height') != height or undo.get('block_hash') != self.hash(chain[-1]):
+            raise ValueError('State database tip undo record is invalid')
+        try:
+            previous_state = self.restore_block_undo(chain_state, undo)
+            verified_state = self.validate_next_block(
+                chain[-1],
+                chain[:-1],
+                previous_state,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('State database tip state is invalid') from exc
+        if verified_state is None or verified_state.as_dict() != chain_state.as_dict():
+            raise ValueError('State database tip state does not match its block')
+        return chain_state
+
+    def load_everything(self, path, reindex=False):
         state_path = Path(path).resolve()
         state = DenariusStorage(state_path).load_state()
 
         chain = state.get('chain')
-        if not self.valid_chain(chain):
-            raise ValueError('State file contains an invalid Denarius chain')
+        persisted_chain_state = state.get('chain_state')
+        undo_records = state.get('undo_records') or {}
+        rewrite_indexes = reindex or persisted_chain_state is None
+        if rewrite_indexes:
+            chain_state, undo_records = self.replay_chain(chain)
+            if chain_state is None:
+                raise ValueError('State file contains an invalid Denarius chain')
+        else:
+            chain_state = self.load_persisted_chain_state(
+                chain,
+                persisted_chain_state,
+                undo_records,
+            )
 
         expected_mining_target = self.expected_target(chain, len(chain))
         encoded_target = state.get('mining_target', target_to_hex(expected_mining_target))
@@ -1174,6 +1540,7 @@ class Blockchain:
 
         pending_validator = Blockchain(miner_name.strip())
         pending_validator.chain = copy.deepcopy(chain)
+        pending_validator.chain_state = chain_state.clone()
         pending_validator.node_address = node_address
         for transaction in state.get('transactions', []):
             if not isinstance(transaction, dict):
@@ -1185,35 +1552,53 @@ class Blockchain:
                 transaction.get('nonce'),
                 transaction.get('signature'),
                 transaction.get('transaction_id'),
+                fee=transaction.get('fee_atomic'),
                 relay=False,
             )
 
         with self._lock:
             self.STATE_PATH = state_path
             self.chain = copy.deepcopy(chain)
+            self.chain_state = chain_state
+            self.undo_records = undo_records
             self.transactions = copy.deepcopy(pending_validator.transactions)
             self.nodes = nodes
+            self.network.health.import_state(state.get('peer_states'))
             self.node_address = node_address
             self.miner_name = miner_name.strip()
             self.MINING_TARGET = mining_target
+        if rewrite_indexes:
+            self.save_everything()
         return self
 
 
 
 app = Flask(__name__)
+configure_trusted_proxy(app)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
-CORS(app, resources={
-    r'/chain': {'origins': '*'},
-    r'/miner/get': {'origins': '*'},
-    r'/nodes/get': {'origins': '*'},
-    r'/transactions/get': {'origins': '*'},
-    r'/transactions/new': {'origins': '*'},
-    r'/accounts/.*': {'origins': '*'},
-})
+SECURE_TRANSPORT = os.environ.get('DENARIUS_SECURE_TRANSPORT', '').lower() in ('1', 'true', 'yes')
+metrics = install_runtime_controls(
+    app,
+    'denarius-node',
+    policies={
+        'healthz': None,
+        'readyz': None,
+        'new_transaction': (20, 60),
+        'receive_transaction': (240, 60),
+        'receive_block': (120, 60),
+        'mine': (10, 60),
+        'start_automining': (10, 60),
+        'stop_automining': (10, 60),
+        'register_nodes': (20, 60),
+        'consensus': (10, 60),
+    },
+    secure_transport=SECURE_TRANSPORT,
+)
 
 blockchain = Blockchain()
 ADMIN_TOKEN_ENV = 'DENARIUS_ADMIN_TOKEN'
+METRICS_TOKEN_ENV = 'DENARIUS_METRICS_TOKEN'
 
 
 def admin_required(func):
@@ -1246,13 +1631,52 @@ def compatible_peer_required(func):
     return wrapper
 
 
+def metrics_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        expected_token = os.environ.get(METRICS_TOKEN_ENV) or os.environ.get(ADMIN_TOKEN_ENV)
+        submitted_token = request.headers.get('X-Denarius-Metrics-Token')
+        if not expected_token or not submitted_token or not hmac.compare_digest(
+            expected_token,
+            submitted_token,
+        ):
+            return jsonify({'message': 'Metrics authentication is required'}), 403
+        return func(*args, **kwargs)
+    return wrapper
+
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    return jsonify({'status': 'alive'}), 200
+
+
+@app.route('/readyz', methods=['GET'])
+def readyz():
+    with blockchain._lock:
+        ready = bool(blockchain.chain) and blockchain.chain[0] == blockchain.GENESIS_BLOCK
+    return jsonify({'status': 'ready' if ready else 'not-ready'}), 200 if ready else 503
+
+
+@app.route('/metrics', methods=['GET'])
+@metrics_required
+def prometheus_metrics():
+    with blockchain._lock:
+        gauges = {
+            'chain_height': len(blockchain.chain) - 1,
+            'chainwork': blockchain.chain_state.chainwork,
+            'mempool_transactions': len(blockchain.transactions),
+            'configured_peers': len(blockchain.nodes),
+        }
+    return Response(metrics.render(gauges), content_type='text/plain; version=0.0.4')
+
+
 @app.route('/transactions/new', methods=['POST'])
 def new_transaction():
     values = request.form
 
     # Check that the required fields are in the POST'ed data
     required = [
-        'sender_address', 'recipient_address', 'amount', 'nonce',
+        'sender_address', 'recipient_address', 'amount', 'fee', 'nonce',
         'signature', 'transaction_id',
     ]
     if not all(k in values for k in required):
@@ -1261,6 +1685,7 @@ def new_transaction():
     transaction_result = blockchain.submit_transaction(
         values['sender_address'], values['recipient_address'], values['amount'],
         values['nonce'], values['signature'], values['transaction_id'],
+        fee=values['fee'],
     )
 
     if transaction_result == False:
@@ -1287,7 +1712,7 @@ def receive_transaction():
     values = request.form
 
     required = [
-        'sender_address', 'recipient_address', 'amount', 'nonce',
+        'sender_address', 'recipient_address', 'amount', 'fee', 'nonce',
         'signature', 'transaction_id',
     ]
     if not all(k in values for k in required):
@@ -1299,6 +1724,7 @@ def receive_transaction():
     transaction_result = blockchain.submit_transaction(
         values['sender_address'], values['recipient_address'], values['amount'],
         values['nonce'], values['signature'], values['transaction_id'],
+        fee=values['fee'],
         relay=True,
     )
 
@@ -1320,17 +1746,30 @@ def get_account(address):
         'address': address,
         'balance': blockchain.get_balance(address),
         'balance_atomic': str(blockchain.get_atomic_balance(address)),
+        'immature_balance': blockchain.format_amount(blockchain.get_immature_balance(address)),
+        'immature_balance_atomic': str(blockchain.get_immature_balance(address)),
         'next_nonce': blockchain.get_next_nonce(address),
     }), 200
 
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
+    try:
+        limit = int(request.args.get('limit', blockchain.MAX_CHAIN_API_BLOCKS))
+        submitted_start = request.args.get('start')
+        start = int(submitted_start) if submitted_start is not None else None
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid chain range'}), 400
+    if limit < 1 or limit > blockchain.MAX_CHAIN_API_BLOCKS or (start is not None and start < 0):
+        return jsonify({'message': 'Invalid chain range'}), 400
     with blockchain._lock:
-        chain = copy.deepcopy(blockchain.chain)
+        chain_length = len(blockchain.chain)
+        start = max(0, chain_length - limit) if start is None else start
+        chain = copy.deepcopy(blockchain.chain[start:start + limit])
     response = {
         'chain': chain,
-        'length': len(chain),
+        'length': chain_length,
+        'start': start,
     }
     return jsonify(response), 200
 
@@ -1353,6 +1792,34 @@ def mine():
     return jsonify(response), 200
 
 
+@app.route('/mining/auto', methods=['GET'])
+@admin_required
+def get_automining():
+    return jsonify(blockchain.automining_status()), 200
+
+
+@app.route('/mining/auto/start', methods=['POST'])
+@admin_required
+def start_automining():
+    status = blockchain.start_automining()
+    if status is False:
+        return jsonify({'message': 'Configure a valid miner before starting automining'}), 406
+    return jsonify({
+        'message': 'Automining started',
+        **status,
+    }), 200
+
+
+@app.route('/mining/auto/stop', methods=['POST'])
+@admin_required
+def stop_automining():
+    status = blockchain.stop_automining()
+    return jsonify({
+        'message': 'Automining stopped' if not status['running'] else 'Automining is stopping',
+        **status,
+    }), 200
+
+
 @app.route('/protocol', methods=['GET'])
 def get_protocol():
     return jsonify(blockchain.protocol_status()), 200
@@ -1369,13 +1836,14 @@ def get_headers():
     if start < 0 or limit < 1 or limit > blockchain.MAX_HEADERS_PER_REQUEST:
         return jsonify({'message': 'Invalid header range'}), 400
     with blockchain._lock:
-        chain = copy.deepcopy(blockchain.chain)
-    headers = blockchain.headers_for_chain(chain)
+        chain_length = len(blockchain.chain)
+        blocks = copy.deepcopy(blockchain.chain[start:start + limit])
+    headers = blockchain.headers_for_chain(blocks)
     return jsonify({
         'protocol': blockchain.protocol_status(),
-        'length': len(headers),
+        'length': chain_length,
         'start': start,
-        'headers': headers[start:start + limit],
+        'headers': headers,
     }), 200
 
 
@@ -1390,12 +1858,13 @@ def get_blocks():
     if start < 0 or limit < 1 or limit > blockchain.MAX_BLOCKS_PER_REQUEST:
         return jsonify({'message': 'Invalid block range'}), 400
     with blockchain._lock:
-        chain = copy.deepcopy(blockchain.chain)
+        chain_length = len(blockchain.chain)
+        blocks = copy.deepcopy(blockchain.chain[start:start + limit])
     return jsonify({
         'protocol': blockchain.protocol_status(),
-        'length': len(chain),
+        'length': chain_length,
         'start': start,
-        'blocks': chain[start:start + limit],
+        'blocks': blocks,
     }), 200
 
 
@@ -1535,6 +2004,11 @@ def main(argv=None):
         help='migrate a Phase 1 JSON state file into the selected database',
     )
     parser.add_argument(
+        '--reindex',
+        action='store_true',
+        help='fully replay and rewrite chain indexes before serving',
+    )
+    parser.add_argument(
         '--sync-interval',
         default=30,
         type=int,
@@ -1545,6 +2019,18 @@ def main(argv=None):
         default=None,
         help='host and port shared with peers (defaults to 127.0.0.1 and --port)',
     )
+    parser.add_argument(
+        '--peer-scheme',
+        choices=('http', 'https'),
+        default=os.environ.get('DENARIUS_PEER_SCHEME', 'http'),
+        help='peer transport; HTTPS verifies peer certificates (default: http)',
+    )
+    parser.add_argument(
+        '--development-server',
+        action='store_true',
+        help='use Flask development serving for local debugging only',
+    )
+    parser.add_argument('--threads', type=int, default=8, help='Waitress worker threads')
     args = parser.parse_args(argv)
     port = args.port
     database_path = Path(args.database).resolve()
@@ -1554,9 +2040,10 @@ def main(argv=None):
         except ValueError as exc:
             parser.error(str(exc))
     blockchain.STATE_PATH = database_path
+    blockchain.network.scheme = args.peer_scheme
     if database_path.exists():
         try:
-            blockchain = blockchain.load_everything(database_path)
+            blockchain = blockchain.load_everything(database_path, reindex=args.reindex)
         except ValueError as exc:
             parser.error(str(exc))
 
@@ -1570,10 +2057,20 @@ def main(argv=None):
         blockchain.nodes.discard(blockchain.advertised_node)
 
     blockchain.start_background_sync(args.sync_interval)
+    configure_json_logging('denarius-node', os.environ.get('DENARIUS_LOG_LEVEL', 'INFO'))
     try:
-        app.run(host=args.host, port=port)
+        if args.development_server:
+            app.run(host=args.host, port=port)
+        else:
+            from waitress import serve
+            serve(app, host=args.host, port=port, threads=max(4, args.threads))
     finally:
+        blockchain.stop_automining()
         blockchain.stop_background_sync()
+        try:
+            blockchain.persist_peer_state()
+        finally:
+            blockchain.network.close()
 
 
 if __name__ == '__main__':

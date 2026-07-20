@@ -1,8 +1,9 @@
 # Security Policy
 
-Denarius is educational software. It has not received an independent security
-audit and must not be used to custody funds with real-world value or exposed to
-the public internet through Flask's development servers.
+Denarius is educational testnet software. It has not received an independent
+security audit and must not be used to custody funds with real-world value.
+Waitress serving and the documented hardening controls do not replace the
+independent review and launch gates required for production.
 
 ## Supported versions
 

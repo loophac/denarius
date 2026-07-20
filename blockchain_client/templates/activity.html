@@ -40,7 +40,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
   function activityCell(value, className) {
     var cell = document.createElement("td");
     cell.textContent = value;
@@ -69,7 +69,7 @@
 
   function confirmedTransactions(chain) {
     var transactions = [];
-    for (var i = chain.length - 1; i >= 1 && transactions.length < 250; i -= 1) {
+    for (var i = chain.length - 1; i >= 0 && transactions.length < 250; i -= 1) {
       var block = chain[i];
       for (var j = block.transactions.length - 1; j >= 0 && transactions.length < 250; j -= 1) {
         transactions.push({transaction: block.transactions[j], block: block});

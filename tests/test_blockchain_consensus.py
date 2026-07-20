@@ -1,9 +1,11 @@
 from collections import OrderedDict
 import binascii
 import copy
+from decimal import Decimal
 import importlib.util
 import json
 import os
+import random
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -39,10 +41,27 @@ def install_flask_stubs():
         def route(self, *args, **kwargs):
             return lambda func: func
 
+        def before_request(self, func):
+            return func
+
+        def after_request(self, func):
+            return func
+
         def run(self, *args, **kwargs):
             return None
 
+    class Response:
+        def __init__(self, response=None, content_type=None):
+            self.response = response
+            self.content_type = content_type
+            self.status_code = 200
+            self.headers = {}
+
+    class Session(dict):
+        permanent = False
+
     flask_stub.Flask = Flask
+    flask_stub.Response = Response
     flask_stub.jsonify = lambda *args, **kwargs: args[0] if args else kwargs
     flask_stub.request = types.SimpleNamespace(
         args={},
@@ -56,7 +75,8 @@ def install_flask_stubs():
     )
     flask_stub.render_template = lambda *args, **kwargs: ""
     flask_stub.redirect = lambda value: value
-    flask_stub.session = {}
+    flask_stub.g = types.SimpleNamespace()
+    flask_stub.session = Session()
     flask_stub.url_for = lambda endpoint: endpoint
 
     flask_cors_stub = types.ModuleType("flask_cors")
@@ -100,12 +120,16 @@ for module_name, original_module in ORIGINAL_MODULES.items():
         sys.modules[module_name] = original_module
 
 Blockchain = denarius_blockchain.Blockchain
-Transaction = denarius_client.Transaction
 
 import denarius_protocol
 import denarius_crypto
+import denarius_operations
+import denarius_storage
 from denarius_storage import migrate_json_state
 from denarius_accounts import DenariusAccountStore
+from denarius_network import PeerNetwork
+from denarius_admin import create_backup, restore_backup, verify_backup
+from denarius_operations import OperationalMetrics, SlidingWindowRateLimiter
 
 
 def mine_block(blockchain):
@@ -143,18 +167,36 @@ def wallet(blockchain):
     )
 
 
-def signed_transaction(sender_address, private_key, recipient_address, value, nonce=0):
-    transaction = Transaction(sender_address, private_key, recipient_address, value, nonce)
-    signature, transaction_id = transaction.signed_data()
-    signed = OrderedDict(transaction.to_dict())
-    signed["signature"] = signature
-    signed["transaction_id"] = transaction_id
-    return signed, signature
+def signed_transaction(
+    sender_address,
+    private_key,
+    recipient_address,
+    value,
+    nonce=0,
+    fee="0.0001",
+):
+    amount_atomic = int(Decimal(str(value)) * denarius_protocol.ATOMIC_UNITS)
+    fee_atomic = int(Decimal(str(fee)) * denarius_protocol.ATOMIC_UNITS)
+    return signed_atomic_transaction(
+        sender_address,
+        private_key,
+        recipient_address,
+        amount_atomic,
+        nonce,
+        fee_atomic,
+    )
 
 
-def signed_atomic_transaction(sender_address, private_key, recipient_address, atomic_value, nonce=0):
+def signed_atomic_transaction(
+    sender_address,
+    private_key,
+    recipient_address,
+    atomic_value,
+    nonce=0,
+    fee_atomic=denarius_protocol.MIN_TRANSACTION_FEE_ATOMIC,
+):
     transaction = denarius_blockchain.transaction_signing_payload(
-        sender_address, recipient_address, atomic_value, nonce
+        sender_address, recipient_address, atomic_value, nonce, fee_atomic
     )
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(binascii.unhexlify(private_key))
     signature = binascii.hexlify(
@@ -175,15 +217,29 @@ def submit_signed(blockchain, transaction, relay=False):
         transaction["nonce"],
         transaction["signature"],
         transaction["transaction_id"],
+        fee=transaction["fee_atomic"],
         relay=relay,
     )
 
 
+FUNDED_CHAIN = None
+
+
 def funded_blockchain():
+    global FUNDED_CHAIN
+    if FUNDED_CHAIN is None:
+        funded = Blockchain()
+        address, private_key = wallet(funded)
+        funded.node_address = address
+        for _ in range(denarius_protocol.COINBASE_MATURITY + 1):
+            mine_block(funded)
+        FUNDED_CHAIN = (copy.deepcopy(funded.chain), address, private_key)
+
+    chain, address, private_key = FUNDED_CHAIN
     blockchain = Blockchain()
-    address, private_key = wallet(blockchain)
+    blockchain.chain = copy.deepcopy(chain)
     blockchain.node_address = address
-    mine_block(blockchain)
+    blockchain.chain_state, blockchain.undo_records = blockchain.replay_chain(blockchain.chain)
     return blockchain, address, private_key
 
 
@@ -226,7 +282,7 @@ def test_pending_transactions_are_counted_against_balance():
     bob_address, _ = wallet(blockchain)
     carol_address, _ = wallet(blockchain)
 
-    reward = blockchain.block_reward(1)
+    reward = blockchain.block_reward(1) - denarius_protocol.MIN_TRANSACTION_FEE_ATOMIC
     bob_transaction, bob_signature = signed_transaction(
         sender_address,
         private_key,
@@ -354,12 +410,11 @@ def test_miner_registration_requires_valid_denarius_address():
 def test_valid_chain_replays_transaction_balances():
     blockchain, sender_address, private_key = funded_blockchain()
     recipient_address, _ = wallet(blockchain)
-    reward = blockchain.block_reward(1)
     transaction, signature = signed_atomic_transaction(
         sender_address,
         private_key,
         recipient_address,
-        reward + 1,
+        blockchain.TOTAL_AMOUNT,
     )
 
     blockchain.transactions.append(transaction)
@@ -599,6 +654,7 @@ def test_standard_console_accounts_cannot_access_node_administration():
                 ("/api/nodes", denarius_client.api_nodes),
                 ("/api/nodes", denarius_client.api_register_nodes),
                 ("/api/mine", denarius_client.api_mine),
+                ("/api/automine", denarius_client.api_automine),
                 ("/api/resolve", denarius_client.api_resolve),
             )
             for path, endpoint in restricted_apis:
@@ -673,6 +729,7 @@ def test_submit_transaction_relays_to_known_peers():
     with patch.object(denarius_blockchain.requests, "post") as post:
         post.return_value = Mock(status_code=201)
         result = submit_signed(blockchain, transaction, relay=True)
+        blockchain.network.wait_for_relays(timeout=1)
 
     assert result == len(blockchain.chain)
     post.assert_called_once()
@@ -696,6 +753,7 @@ def test_transaction_relay_skips_incompatible_peers():
 
     with patch.object(denarius_blockchain.requests, "get", return_value=response), patch.object(denarius_blockchain.requests, "post") as post:
         assert submit_signed(blockchain, transaction, relay=True)
+        blockchain.network.wait_for_relays(timeout=1)
 
     post.assert_not_called()
     health = blockchain.peer_health()[0]
@@ -718,6 +776,7 @@ def test_received_transaction_is_relayed_once():
         "sender_address": transaction["sender_address"],
         "recipient_address": transaction["recipient_address"],
         "amount": transaction["amount_atomic"],
+        "fee": transaction["fee_atomic"],
         "nonce": transaction["nonce"],
         "signature": signature,
         "transaction_id": transaction["transaction_id"],
@@ -922,6 +981,93 @@ def test_peer_health_becomes_unreachable_after_repeated_failures():
     assert health["consecutive_failures"] == 3
 
 
+def test_relay_is_asynchronous_and_bounded():
+    entered = threading.Event()
+    release = threading.Event()
+    requests_module = Mock()
+    requests_module.RequestException = Exception
+
+    def slow_post(*args, **kwargs):
+        entered.set()
+        release.wait(2)
+        return Mock(status_code=201)
+
+    requests_module.post.side_effect = slow_post
+    network = PeerNetwork(
+        requests_module=requests_module,
+        relay_workers=1,
+        relay_queue_size=0,
+    )
+    peer = "127.0.0.1:5001"
+    network.health.record_compatible(peer, denarius_blockchain.protocol_identity())
+    transaction = {
+        "sender_address": "sender",
+        "recipient_address": "recipient",
+        "amount_atomic": "1",
+        "fee_atomic": str(denarius_protocol.MIN_TRANSACTION_FEE_ATOMIC),
+        "nonce": 0,
+        "signature": "signature",
+        "transaction_id": "1" * 64,
+    }
+    try:
+        first = network.relay_transaction([peer], transaction)
+        assert len(first) == 1
+        assert entered.wait(1)
+
+        second = network.relay_transaction([peer], transaction)
+        assert second == []
+        assert network.peer_health([peer])[0]["relay_drops"] == 1
+    finally:
+        release.set()
+        network.wait_for_relays(timeout=2)
+        network.close()
+
+
+def test_peer_misbehavior_bans_and_persists_across_restart():
+    blockchain = Blockchain()
+    peer = "127.0.0.1:5001"
+    blockchain.nodes.add(peer)
+    for _ in range(4):
+        blockchain.network.health.record_misbehavior(peer, "invalid block", score=25)
+
+    assert blockchain.network.health.is_banned(peer) is True
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "denarius-testnet-v3.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+        restored = Blockchain().load_everything(database_path)
+
+    assert restored.network.health.is_banned(peer) is True
+    assert restored.peer_health()[0]["score"] >= 100
+
+
+def test_discovered_peers_are_bounded_and_network_diverse():
+    blockchain = Blockchain()
+    source = "127.0.0.1:5001"
+    blockchain.nodes.add(source)
+
+    for port in (5002, 5003, 5004):
+        assert blockchain.register_node(
+            "127.0.0.1:" + str(port),
+            discovered_from=source,
+        ) is True
+
+    try:
+        blockchain.register_node("127.0.0.1:5005", discovered_from=source)
+    except ValueError as exc:
+        assert "network group limit" in str(exc)
+    else:
+        raise AssertionError("discovered peer bypassed the network-group limit")
+
+    try:
+        blockchain.register_node("peer.example:5000", discovered_from=source)
+    except ValueError as exc:
+        assert "IP addresses" in str(exc)
+    else:
+        raise AssertionError("peer gossip accepted a hostname")
+
+
 def test_background_synchronization_runs_and_can_be_woken():
     blockchain = Blockchain()
     synchronized = threading.Event()
@@ -940,6 +1086,57 @@ def test_background_synchronization_runs_and_can_be_woken():
         thread.join(timeout=1)
 
     assert thread.is_alive() is False
+
+
+def test_automining_runs_on_the_node_and_stops_cleanly():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    attempted = threading.Event()
+
+    def fake_mine(relay=True, persist=True, stop_event=None):
+        attempted.set()
+        return {"block_number": 1}
+
+    with patch.object(blockchain, "mine_pending_transactions", side_effect=fake_mine):
+        started = blockchain.start_automining()
+        assert started["running"] is True
+        assert attempted.wait(1)
+        for _ in range(100):
+            if blockchain.automining_status()["blocks_mined"] == 1:
+                break
+            threading.Event().wait(0.01)
+        stopped = blockchain.stop_automining()
+
+    assert stopped["running"] is False
+    assert stopped["blocks_mined"] == 1
+    assert stopped["last_block"] == 1
+
+
+def test_automining_requires_a_configured_miner_and_is_not_persisted():
+    blockchain = Blockchain()
+    assert blockchain.start_automining() is False
+
+    blockchain.node_address, _ = wallet(blockchain)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "automining.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+        restored = Blockchain().load_everything(database_path)
+
+    assert restored.automining_status()["running"] is False
+    assert restored.automining_status()["started_at"] is None
+
+
+def test_proof_of_work_can_be_cancelled_by_autominer_shutdown():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    stop_event = threading.Event()
+    stop_event.set()
+
+    assert blockchain.proof_of_work(
+        blockchain.create_candidate_block(),
+        stop_event=stop_event,
+    ) is None
 
 
 def test_chainwork_uses_exact_target_formula():
@@ -981,6 +1178,264 @@ def test_confirmed_denarii_monetary_policy():
         height += denarius_protocol.HALVING_INTERVAL
 
     assert scheduled_supply <= denarius_protocol.MAX_SUPPLY_ATOMIC
+
+
+def test_coinbase_rewards_are_immature_for_ten_blocks():
+    blockchain = Blockchain()
+    miner_address, _ = wallet(blockchain)
+    blockchain.node_address = miner_address
+
+    mine_block(blockchain)
+    reward = blockchain.block_reward(1)
+    assert blockchain.get_atomic_balance(miner_address) == 0
+    assert blockchain.get_immature_balance(miner_address) == reward
+
+    for _ in range(denarius_protocol.COINBASE_MATURITY - 1):
+        mine_block(blockchain)
+    assert blockchain.get_atomic_balance(miner_address) == 0
+
+    mine_block(blockchain)
+    assert blockchain.get_atomic_balance(miner_address) == reward
+
+
+def test_transaction_fees_are_signed_and_paid_to_the_miner():
+    blockchain, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(blockchain)
+    starting_balance = blockchain.get_atomic_balance(sender_address)
+    transaction, _ = signed_transaction(
+        sender_address,
+        private_key,
+        recipient_address,
+        "2",
+    )
+
+    assert submit_signed(blockchain, transaction)
+    block = mine_block(blockchain)
+
+    fee = denarius_protocol.MIN_TRANSACTION_FEE_ATOMIC
+    assert transaction["fee_atomic"] == str(fee)
+    assert block["transactions"][0]["amount_atomic"] == str(
+        blockchain.block_reward(block["block_number"]) + fee
+    )
+    assert blockchain.get_atomic_balance(recipient_address) == 2 * blockchain.ATOMIC_UNITS
+    assert blockchain.get_atomic_balance(sender_address) == (
+        starting_balance
+        + blockchain.block_reward(2)
+        - 2 * blockchain.ATOMIC_UNITS
+        - fee
+    )
+
+
+def test_transactions_below_the_minimum_fee_are_rejected():
+    blockchain, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(blockchain)
+    transaction, _ = signed_atomic_transaction(
+        sender_address,
+        private_key,
+        recipient_address,
+        blockchain.ATOMIC_UNITS,
+        fee_atomic=1,
+    )
+
+    assert blockchain.submit_transaction(
+        transaction["sender_address"],
+        transaction["recipient_address"],
+        transaction["amount_atomic"],
+        transaction["nonce"],
+        transaction["signature"],
+        transaction["transaction_id"],
+        fee=transaction["fee_atomic"],
+        relay=False,
+    ) is False
+
+
+def test_mempool_limits_each_sender_and_routine_mining_is_incremental():
+    blockchain, sender_address, private_key = funded_blockchain()
+    blockchain.MAX_PENDING_PER_SENDER = 1
+    first_recipient, _ = wallet(blockchain)
+    second_recipient, _ = wallet(blockchain)
+    first, _ = signed_transaction(sender_address, private_key, first_recipient, "1")
+    second, _ = signed_transaction(
+        sender_address,
+        private_key,
+        second_recipient,
+        "1",
+        nonce=1,
+    )
+
+    assert submit_signed(blockchain, first)
+    assert submit_signed(blockchain, second) is False
+
+    with patch.object(blockchain, "valid_chain", side_effect=AssertionError("full replay")):
+        block = mine_block(blockchain)
+
+    assert blockchain.chain_state.tip_hash == blockchain.hash(block)
+    assert first["transaction_id"] in blockchain.chain_state.confirmed_transactions
+
+
+def test_sqlite_appends_one_block_and_persists_indexed_state_and_undo():
+    blockchain = Blockchain()
+    miner_address, _ = wallet(blockchain)
+    blockchain.node_address = miner_address
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "denarius-testnet-v3.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+
+        with patch.object(
+            denarius_storage.DenariusStorage,
+            "save_state",
+            side_effect=AssertionError("full snapshot rewrite"),
+        ):
+            block = blockchain.mine_pending_transactions(relay=False, persist=True)
+
+        assert block is not False
+        connection = sqlite3.connect(database_path)
+        try:
+            assert connection.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 2
+            assert connection.execute("SELECT COUNT(*) FROM block_undo").fetchone()[0] == 1
+            assert connection.execute(
+                "SELECT value FROM chain_state WHERE key = 'tip_hash'"
+            ).fetchone()[0] == json.dumps(blockchain.hash(block))
+            reward = connection.execute(
+                "SELECT amount_atomic FROM immature_rewards WHERE height = 1"
+            ).fetchone()
+            assert reward == (str(blockchain.block_reward(1)),)
+        finally:
+            connection.close()
+
+        restored = Blockchain().load_everything(database_path)
+        assert restored.chain_state.as_dict() == blockchain.chain_state.as_dict()
+        assert restored.undo_records[1]["block_hash"] == blockchain.hash(block)
+
+
+def test_routine_restart_uses_index_and_validates_only_the_tip_transition():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    mine_block(blockchain)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "indexed-restart.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+
+        loader = Blockchain()
+        with patch.object(
+            loader,
+            "replay_chain",
+            side_effect=AssertionError("routine restart replayed the complete chain"),
+        ):
+            restored = loader.load_everything(database_path)
+
+    assert restored.chain_state.as_dict() == blockchain.chain_state.as_dict()
+
+
+def test_routine_restart_rejects_a_tampered_balance_index():
+    blockchain, miner_address, _ = funded_blockchain()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "tampered-index.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute(
+                "UPDATE accounts SET balance_atomic = ? WHERE address = ?",
+                ("999999999999", miner_address),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        try:
+            Blockchain().load_everything(database_path)
+        except ValueError as exc:
+            assert "checksum" in str(exc)
+        else:
+            raise AssertionError("tampered indexed balance was loaded")
+
+
+def test_block_undo_restores_the_previous_indexed_state():
+    blockchain, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(blockchain)
+    transaction, _ = signed_transaction(
+        sender_address,
+        private_key,
+        recipient_address,
+        "1",
+    )
+    previous = blockchain.chain_state.clone()
+
+    assert submit_signed(blockchain, transaction)
+    block = mine_block(blockchain)
+    restored = blockchain.restore_block_undo(
+        blockchain.chain_state,
+        blockchain.undo_records[block["block_number"]],
+    )
+
+    assert restored.as_dict() == previous.as_dict()
+
+
+def test_phase_six_uses_an_explicit_testnet_identity_and_new_genesis():
+    assert denarius_protocol.PROTOCOL_VERSION == 3
+    assert denarius_protocol.NETWORK_ID == "denarius-testnet-v3"
+    assert denarius_protocol.NETWORK_KIND == "testnet"
+    assert "mainnet" not in denarius_protocol.NETWORK_ID
+    assert denarius_protocol.GENESIS_BLOCK["timestamp"] == 1784505600
+    assert denarius_protocol.GENESIS_BLOCK["previous_hash"] == denarius_protocol.sha256_hex(
+        denarius_protocol.GENESIS_MESSAGE.encode("utf8")
+    )
+    assert denarius_protocol.GENESIS_HASH == denarius_protocol.block_hash(
+        denarius_protocol.GENESIS_BLOCK
+    )
+
+    identity = denarius_blockchain.protocol_identity()
+    assert identity["network"] == denarius_protocol.NETWORK_ID
+    assert identity["network_kind"] == "testnet"
+    assert identity["consensus"] == "sha256-proof-of-work"
+    assert identity["genesis_hash"] == denarius_protocol.GENESIS_HASH
+
+
+def test_consensus_upgrades_activate_only_at_deterministic_heights():
+    active = denarius_protocol.active_consensus_upgrade(0)
+
+    assert active == {
+        "name": "testnet-v3",
+        "activation_height": 0,
+        "protocol_version": 3,
+    }
+    assert denarius_protocol.active_consensus_upgrade(1) == active
+
+    for invalid_height in (-1, True, "1"):
+        try:
+            denarius_protocol.active_consensus_upgrade(invalid_height)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid consensus activation height was accepted")
+
+
+def test_state_database_is_bound_to_network_and_genesis():
+    blockchain = Blockchain()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "denarius-testnet-v3.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+
+        connection = sqlite3.connect(database_path)
+        with connection:
+            connection.execute(
+                "UPDATE metadata SET value = ? WHERE key = ?",
+                (json.dumps("another-network"), "network_id"),
+            )
+        connection.close()
+
+        try:
+            denarius_storage.DenariusStorage(database_path).load_state()
+        except ValueError as exc:
+            assert "another Denarius network" in str(exc)
+        else:
+            raise AssertionError("database from another network was accepted")
 
 
 def test_account_nonces_enforce_transaction_order():
@@ -1043,37 +1498,13 @@ def test_retarget_is_deterministic_and_time_bounded():
     assert blockchain.expected_target(chain, denarius_protocol.RETARGET_INTERVAL - 1) == denarius_protocol.INITIAL_TARGET
 
 
-def test_wallet_file_encrypts_private_key_and_rejects_wrong_password():
-    password = "a strong wallet password"
-    wallet_document = denarius_crypto.generate_encrypted_wallet(password)
+def test_python_crypto_boundary_contains_no_wallet_private_key_operations():
+    crypto_source = (ROOT / "denarius_crypto.py").read_text()
 
-    assert set(wallet_document) == set(denarius_crypto.WALLET_FIELDS)
-    assert "private_key" not in wallet_document
-    wallet_data = denarius_crypto.decrypt_wallet(wallet_document, password)
-    assert wallet_data["address"] == wallet_document["address"]
-    assert len(wallet_data["private_key"]) == 64
-
-    try:
-        denarius_crypto.decrypt_wallet(wallet_document, "the wrong password")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("encrypted wallet accepted the wrong password")
-
-
-def test_wallet_ciphertext_detects_tampering():
-    wallet_document = denarius_crypto.generate_encrypted_wallet("another strong password")
-    tampered = copy.deepcopy(wallet_document)
-    tampered["ciphertext"] = (
-        "00" if tampered["ciphertext"][:2] != "00" else "11"
-    ) + tampered["ciphertext"][2:]
-
-    try:
-        denarius_crypto.decrypt_wallet(tampered, "another strong password")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("tampered wallet ciphertext was decrypted")
+    assert "generate_encrypted_wallet" not in crypto_source
+    assert "decrypt_wallet" not in crypto_source
+    assert "Ed25519PrivateKey" not in crypto_source
+    assert "private_key" not in crypto_source
 
 
 def test_phase_one_json_state_can_migrate_to_sqlite():
@@ -1117,29 +1548,40 @@ def test_wallet_ui_never_requests_or_displays_raw_private_keys():
     send_template = (ROOT / "blockchain_client" / "templates" / "send.html").read_text()
     base_template = (ROOT / "blockchain_client" / "templates" / "base.html").read_text()
     store_source = (ROOT / "blockchain_client" / "static" / "js" / "wallet_store.js").read_text()
+    crypto_source = (ROOT / "blockchain_client" / "static" / "js" / "wallet_crypto.js").read_text()
+    console_source = CLIENT_MODULE_PATH.read_text()
 
-    assert "private_key" not in create_template
-    assert "sender_private_key" not in send_template
+    assert "/api/wallets/new" not in create_template
+    assert "/api/wallets/inspect" not in create_template
+    assert "/api/transactions/sign" not in send_template
+    assert "DenariusWalletCrypto.create" in create_template
+    assert "DenariusWalletCrypto.signTransaction" in send_template
     assert 'id="sender_wallet"' in send_template
     assert 'name="wallet_file"' not in send_template
-    assert "wallet_document" in send_template
     assert "localStorage" in store_source
     assert "private_key" not in store_source
+    assert "subtle.generateKey" in crypto_source
+    assert "subtle.sign" in crypto_source
+    assert "privateBytes.fill(0)" in crypto_source
+    assert "decrypt_wallet" not in console_source
+    assert "generate_encrypted_wallet" not in console_source
     assert "denarius-wallet-scope" in base_template
     assert "encryptedWallets.v2." in store_source
 
+    operations_source = (ROOT / "denarius_operations.py").read_text()
+    assert "script-src 'self' 'unsafe-inline'" not in operations_source
+    for template_name in ("activity.html", "network.html", "overview.html", "send.html", "wallets.html"):
+        template = (ROOT / "blockchain_client" / "templates" / template_name).read_text()
+        assert '<script nonce="{{ csp_nonce }}">' in template
 
-def test_wallet_service_accepts_a_browser_stored_wallet_document():
-    wallet_document = denarius_crypto.generate_encrypted_wallet("browser wallet password")
-    original_form = denarius_client.request.form
-    original_files = denarius_client.request.files
-    try:
-        denarius_client.request.form = {"wallet_document": json.dumps(wallet_document)}
-        denarius_client.request.files = {}
-        assert denarius_client.submitted_wallet_document() == wallet_document
-    finally:
-        denarius_client.request.form = original_form
-        denarius_client.request.files = original_files
+
+def test_console_exposes_protocol_but_no_wallet_custody_endpoints():
+    console_source = CLIENT_MODULE_PATH.read_text()
+
+    assert "@app.route('/api/protocol')" in console_source
+    assert "@app.route('/api/wallets/new'" not in console_source
+    assert "@app.route('/api/wallets/inspect'" not in console_source
+    assert "@app.route('/api/transactions/sign'" not in console_source
 
 
 def test_node_and_console_are_separate_process_boundaries():
@@ -1167,3 +1609,201 @@ def test_phase_three_uses_one_coherent_console_navigation():
     assert "{% if is_admin %}" in base_template
     assert "--console-port" in launcher_source
     assert "--dashboard-port" not in launcher_source
+    overview_template = (ROOT / "blockchain_client" / "templates" / "overview.html").read_text()
+    assert 'id="mine_block"' in overview_template
+    assert 'id="toggle_automine"' in overview_template
+    assert overview_template.index('id="mine_block"') < overview_template.index('id="toggle_automine"')
+
+
+def test_peer_transport_supports_verified_https_urls():
+    network = PeerNetwork(scheme="https")
+    try:
+        assert network.peer_url("203.0.113.4:5443", "/protocol") == (
+            "https://203.0.113.4:5443/protocol"
+        )
+    finally:
+        network.close()
+
+    try:
+        PeerNetwork(scheme="ftp")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsupported peer transport was accepted")
+
+
+def test_pending_transaction_with_nonminimum_fee_survives_restart():
+    blockchain, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(blockchain)
+    transaction, _ = signed_transaction(
+        sender_address,
+        private_key,
+        recipient_address,
+        "1",
+        fee="0.0002",
+    )
+    assert submit_signed(blockchain, transaction)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "pending-fee.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+        restored = Blockchain().load_everything(database_path)
+
+    assert restored.transactions == [transaction]
+
+
+def test_malformed_transaction_fuzz_cases_never_crash_validation():
+    blockchain = Blockchain()
+    randomizer = random.Random(6006)
+    values = [
+        None,
+        True,
+        False,
+        -1,
+        0,
+        1,
+        1.5,
+        "",
+        "NaN",
+        "not-an-address",
+        [],
+        {},
+    ]
+    for _ in range(500):
+        fields = [randomizer.choice(values) for _ in range(7)]
+        result = blockchain.submit_transaction(
+            fields[0],
+            fields[1],
+            fields[2],
+            fields[3],
+            fields[4],
+            fields[5],
+            fee=fields[6],
+            relay=False,
+        )
+        assert result is False
+
+
+def test_rate_limiter_and_metrics_are_bounded_and_machine_readable():
+    limiter = SlidingWindowRateLimiter(max_keys=2)
+    assert limiter.check("first", 2, 60, now=100) == (True, 0)
+    assert limiter.check("first", 2, 60, now=101) == (True, 0)
+    allowed, retry_after = limiter.check("first", 2, 60, now=102)
+    assert allowed is False
+    assert retry_after > 0
+    assert limiter.check("first", 2, 60, now=161) == (True, 0)
+
+    limiter.check("second", 1, 60, now=200)
+    limiter.check("third", 1, 60, now=200)
+    assert len(limiter._events) <= 2
+
+    metrics = OperationalMetrics("test-service")
+    metrics.observe_request("protocol", "GET", 200, 0.125)
+    output = metrics.render({"chain_height": 10})
+    assert 'service="test-service"' in output
+    assert 'endpoint="protocol"' in output
+    assert "denarius_chain_height" in output
+
+
+def test_public_chain_route_returns_a_bounded_recent_window():
+    blockchain = Blockchain()
+    blockchain.chain = [{"height": height} for height in range(300)]
+    with patch.object(denarius_blockchain, "blockchain", blockchain), patch.object(
+        denarius_blockchain.request,
+        "args",
+        {"limit": "10"},
+    ):
+        payload, status = denarius_blockchain.full_chain()
+
+    assert status == 200
+    assert payload["length"] == 300
+    assert payload["start"] == 290
+    assert payload["chain"] == [{"height": height} for height in range(290, 300)]
+
+
+def test_trusted_proxy_count_is_explicitly_bounded():
+    fake_app = types.SimpleNamespace(wsgi_app=object())
+    with patch.dict(os.environ, {"DENARIUS_TRUSTED_PROXY_COUNT": "0"}):
+        assert denarius_operations.configure_trusted_proxy(fake_app) == 0
+    with patch.dict(os.environ, {"DENARIUS_TRUSTED_PROXY_COUNT": "9"}):
+        try:
+            denarius_operations.configure_trusted_proxy(fake_app)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe proxy trust depth was accepted")
+
+
+def test_backup_verification_and_restore_round_trip():
+    blockchain = Blockchain()
+    accounts = None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        directory = Path(tmpdir)
+        chain_database = directory / "chain.db"
+        accounts_database = directory / "accounts.db"
+        blockchain.STATE_PATH = chain_database
+        blockchain.save_everything()
+        accounts = DenariusAccountStore(accounts_database)
+        accounts.create_account("operator", "salt:hash")
+
+        backup_directory = directory / "backup"
+        create_backup(chain_database, accounts_database, backup_directory)
+        assert verify_backup(backup_directory)["network"] == denarius_protocol.NETWORK_ID
+
+        restored_chain = directory / "restored-chain.db"
+        restored_accounts = directory / "restored-accounts.db"
+        restore_backup(backup_directory, restored_chain, restored_accounts)
+
+        assert Blockchain().load_everything(restored_chain).chain == blockchain.chain
+        assert DenariusAccountStore(restored_accounts).has_admin() is True
+
+
+def test_backup_verification_detects_file_tampering():
+    blockchain = Blockchain()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        directory = Path(tmpdir)
+        chain_database = directory / "chain.db"
+        accounts_database = directory / "accounts.db"
+        blockchain.STATE_PATH = chain_database
+        blockchain.save_everything()
+        DenariusAccountStore(accounts_database).create_account("operator", "salt:hash")
+        backup_directory = directory / "backup"
+        create_backup(chain_database, accounts_database, backup_directory)
+        with (backup_directory / "denarius-chain.sqlite3").open("ab") as backup_file:
+            backup_file.write(b"tampered")
+
+        try:
+            verify_backup(backup_directory)
+        except ValueError as exc:
+            assert "hash mismatch" in str(exc)
+        else:
+            raise AssertionError("tampered backup passed verification")
+
+
+def test_sqlite_block_append_rolls_back_after_simulated_crash():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "crash.db"
+        blockchain.STATE_PATH = database_path
+        blockchain.save_everything()
+
+        with patch.object(
+            denarius_storage.DenariusStorage,
+            "_replace_chain_state_metadata",
+            side_effect=RuntimeError("simulated process failure"),
+        ):
+            try:
+                blockchain.mine_pending_transactions(relay=False, persist=True)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("simulated storage failure was not raised")
+
+        connection = sqlite3.connect(database_path)
+        try:
+            assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert connection.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 1
+        finally:
+            connection.close()

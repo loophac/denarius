@@ -4,6 +4,11 @@ Denarius is an educational proof-of-work blockchain prototype and the conceptual
 foundation for a lightweight cryptocurrency. It is intentionally compact, but it
 should still be treated as demonstration software rather than production money.
 
+The active network is `denarius-testnet-v3`. Testnet DEN has no represented
+monetary value. Denarius does not currently publish or operate a mainnet; see
+[docs/CONSENSUS.md](docs/CONSENSUS.md) and
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the Phase 6 production gates.
+
 This work is based on :
 
 - [adilmoujahid/blockchain-python-tutorial](https://github.com/adilmoujahid/blockchain-python-tutorial)  
@@ -17,6 +22,7 @@ Compared with the original one, we now introduce:
 - Denarii (coin name).
 - Constant wealth (`1e8` coin in total).
 - Setting miner's information.
+- Administrator-controlled automining with live console status.
 - Balance check before every transaction.
 - Integer atomic units (`1 DEN = 100,000,000` atomic units) for consensus
   accounting.
@@ -26,7 +32,7 @@ Compared with the original one, we now introduce:
 - Canonical genesis block.
 - Ed25519 wallet keys, signatures, and checked addresses.
 - Transactional SQLite state persistence instead of Python pickle files.
-- Password-encrypted wallet files using scrypt and AES-256-GCM.
+- Browser-generated Ed25519 wallets encrypted with PBKDF2 and AES-256-GCM.
 - Separate node API and unified local Denarius Console processes.
 - Persistent console accounts with administrator and standard-user roles.
 - Deduplicated transaction and block relay across compatible peers.
@@ -55,10 +61,14 @@ currency notation. Consensus uses integer atomic units, with
 - Subsidy halving interval: `1,051,200 blocks` (approximately four years)
 - Initial block subsidy: `47.56468797 DEN`
 - Difficulty target adjustment: every `10,080 blocks` (approximately two weeks)
+- Minimum transaction fee: `0.0001 DEN`
+- Mining reward maturity: `10 blocks`
 
 Integer subsidy rounding keeps scheduled issuance below the hard cap. The
 consensus values and canonical serialization rules live in
 `denarius_protocol.py` so the node and wallet sign and validate identical data.
+Testnet v3 uses an intentionally accessible development target; it does not
+represent production proof-of-work security.
 
 
 ## Requirements
@@ -119,7 +129,7 @@ without changing consensus data:
 python run_denarius.py --sync-interval 60
 ```
 
-Node state is stored transactionally in `states/denarius.db`. SQLite keeps
+Node state is stored transactionally in `states/denarius-testnet-v3.db`. SQLite keeps
 blocks, pending transactions, peers, and node metadata in separate tables and
 uses full synchronous writes with write-ahead logging.
 
@@ -131,7 +141,7 @@ The two services can also be run independently:
 
 ```bash
 export DENARIUS_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
-denarius-node --port 5000 --database states/denarius.db
+denarius-node --port 5000 --database states/denarius-testnet-v3.db
 denarius-console --port 8080 --accounts-database states/console-accounts.db
 ```
 
@@ -141,25 +151,26 @@ the signed-in account's persisted role and CSRF token, then forwards authorized
 administration calls to the node. Set `DENARIUS_SECRET_KEY` for a stable console
 session key.
 
-Phase 1 uses protocol version 2, account nonces, transaction IDs, Merkle roots,
-and deterministic proof-of-work targets. State files created by Phase 0 or
-older versions use a different consensus format and are intentionally rejected.
-Archive an older state file and start without it to create a fresh Phase 1
-chain. Phases 2 through 5 do not change consensus or require another chain
-reset. A valid Phase 1 JSON state can be migrated into SQLite:
+Phase 6 begins with protocol version 3 and a new Testnet v3 genesis block. State
+from protocol version 2 belongs to the retired demonstration chain and is
+intentionally rejected. Archive `states/denarius.db`; the default launcher will
+create `states/denarius-testnet-v3.db`. JSON migration remains available only
+for data already using the active protocol and genesis:
 
 ```bash
-python blockchain/blockchain.py --migrate-json states/blockchain.json --database states/denarius.db
+python blockchain/blockchain.py --migrate-json states/blockchain.json --database states/denarius-testnet-v3.db
 ```
 
-The wallet creates an Ed25519 key, encrypts it with scrypt and AES-256-GCM, and
-saves the encrypted wallet document in account-scoped browser local storage.
-Raw private keys are never returned to the web page or stored in the browser. To
-send DEN, select a saved sender wallet and enter its password; the local console
-process decrypts it in memory, reads the next account nonce from the selected
-node, and uses the plaintext key only for that signing request. `.denwallet`
-backup files can be exported and imported, but they are not required for routine
-payments.
+The browser creates each Ed25519 key with Web Crypto, derives an encryption key
+with PBKDF2-SHA256, and encrypts the private key with AES-256-GCM. The encrypted
+document is saved in account-scoped browser local storage. Decryption and
+transaction signing also happen in the browser; the console and node receive
+only public addresses and signed transactions. `.denwallet` backups can be
+exported and imported, but they are not required for routine payments.
+
+Testnet v3 uses browser wallet format 2. The former server-generated format 1
+belongs to the retired demonstration chain and is intentionally not imported;
+the Python node and console contain no private-key wallet operations.
 
 ## Peer networking
 
@@ -167,6 +178,10 @@ Configured nodes exchange a versioned peer handshake before relaying data or
 synchronizing. Compatibility requires the Denarius network identifier,
 consensus protocol version, canonical genesis hash, peer API version, and the
 header, block, and relay capabilities used by Phase 4.
+
+Testnet v3 retains standalone SHA-256 proof of work while production foundations
+are developed. This is a development decision, not evidence that the current
+network has sufficient hash power for real value.
 
 Synchronization locates the latest shared block, downloads and validates the
 candidate header suffix, compares exact accumulated proof of work, and only
@@ -185,8 +200,9 @@ python run_denarius.py --node-host 0.0.0.0 --advertise-address 192.168.1.25:5000
 
 The web console remains local by default. For testing user accounts on a
 trusted local network, complete administrator setup first, then add
-`--console-host 0.0.0.0` and connect to port `8080`. Do not use the Flask
-development server as a public internet service.
+`--console-host 0.0.0.0` and connect to port `8080`. Public deployments still
+require a TLS-terminating reverse proxy and the hardening guidance in
+`docs/OPERATIONS.md`.
 
 Install the pinned development dependencies, run every regression and process
 integration test, and build the release artifacts:
@@ -212,8 +228,9 @@ across restart, standard-user restrictions, and two-node synchronization.
 ## Release quality
 
 GitHub Actions runs the full suite on Windows and Linux with Python 3.10 and
-3.12, then builds and smoke-tests the wheel and source archive. The stable
-`Release quality` status is the required branch-protection check described in
+3.12, builds and smoke-tests the wheel and source archive, and runs a separate
+adversarial property, benchmark, and soak job. The stable `Release quality`
+status is the required branch-protection check described in
 [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and protocol-change
@@ -223,10 +240,16 @@ and [CHANGELOG.md](CHANGELOG.md) for release history.
 ## Security notes
 
 Denarius remains educational software. The node binds to `127.0.0.1` by default.
-Do not expose the Flask development servers directly to the internet. Encrypted
-wallet files, SQLite state files, private keys, and TLS key files are ignored
-and must never be committed. A `.denwallet` file still controls funds when paired
-with its password; back up both separately. Historical example keys previously
-included in this repository should be considered public and must not be reused.
-Report suspected vulnerabilities privately by following
-[SECURITY.md](SECURITY.md).
+The services use Waitress by default, but must still sit behind HTTPS and the
+controls in [docs/OPERATIONS.md](docs/OPERATIONS.md). Encrypted wallet files,
+SQLite state files, private keys, and TLS key files are ignored and must never
+be committed. A `.denwallet` file still controls funds when paired with its
+password; back up both separately. Historical example keys previously included
+in this repository should be considered public and must not be reused. Report
+suspected vulnerabilities privately by following [SECURITY.md](SECURITY.md).
+
+See [docs/NETWORK_SECURITY.md](docs/NETWORK_SECURITY.md) for peer transport,
+[docs/INCIDENT_RESPONSE.md](docs/INCIDENT_RESPONSE.md) for containment and
+recovery, [docs/ADVERSARIAL_TESTING.md](docs/ADVERSARIAL_TESTING.md) for stress
+verification, and [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md) for the
+independent review required before any mainnet claim.

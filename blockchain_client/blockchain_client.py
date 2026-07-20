@@ -1,41 +1,29 @@
-import binascii
 import hashlib
 import hmac
-import json
 import os
 import re
 import secrets
 import sys
-from decimal import Decimal, InvalidOperation
+from datetime import timedelta
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, Response, g, jsonify, redirect, render_template, request, session, url_for
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from denarius_protocol import (
-    ATOMIC_UNITS,
-    canonical_json_bytes,
-    signed_transaction_id,
-    transaction_signing_payload,
-)
-from denarius_crypto import (
-    address_from_public_key,
-    decrypt_wallet,
-    generate_encrypted_wallet,
-    wallet_public_metadata,
-)
 from denarius_accounts import DenariusAccountStore
+from denarius_operations import (
+    configure_json_logging,
+    configure_trusted_proxy,
+    install_runtime_controls,
+)
 from denarius_paths import state_path
 
-MAX_WALLET_DOCUMENT_BYTES = 64 * 1024
 PASSWORD_ITERATIONS = 240000
 DUMMY_PASSWORD_HASH = ('00' * 16) + ':' + ('00' * 32)
 NODE_TIMEOUT = 5
@@ -45,75 +33,36 @@ DEFAULT_ACCOUNT_DATABASE = state_path('console-accounts.db')
 USERNAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$')
 
 
-class Transaction:
-    ATOMIC_UNITS = ATOMIC_UNITS
-
-    def __init__(self, sender_address, sender_private_key, recipient_address, value, nonce):
-        self.sender_address = sender_address
-        self.sender_private_key = sender_private_key
-        self.recipient_address = recipient_address
-        self.value = self.parse_amount(value)
-        try:
-            self.nonce = int(str(nonce))
-        except (TypeError, ValueError) as exc:
-            raise ValueError('Invalid nonce') from exc
-        if self.nonce < 0:
-            raise ValueError('Invalid nonce')
-
-        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(
-            binascii.unhexlify(self.sender_private_key)
-        )
-        public_key_bytes = private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-        if address_from_public_key(public_key_bytes) != self.sender_address:
-            raise ValueError('Private key does not match sender address')
-
-    def parse_amount(self, value):
-        try:
-            amount = Decimal(str(value))
-        except (InvalidOperation, ValueError):
-            raise ValueError('Invalid amount')
-
-        if not amount.is_finite() or amount <= 0:
-            raise ValueError('Invalid amount')
-
-        atomic_amount = amount * self.ATOMIC_UNITS
-        if atomic_amount != atomic_amount.to_integral_value():
-            raise ValueError('Invalid amount')
-
-        return str(int(atomic_amount))
-
-    def to_dict(self):
-        return transaction_signing_payload(
-            self.sender_address,
-            self.recipient_address,
-            self.value,
-            self.nonce,
-        )
-
-    def canonical_transaction_bytes(self):
-        return canonical_json_bytes(self.to_dict())
-
-    def sign_transaction(self):
-        """
-        Sign transaction with private key
-        """
-        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(binascii.unhexlify(self.sender_private_key))
-        return binascii.hexlify(private_key.sign(self.canonical_transaction_bytes())).decode('ascii')
-
-    def signed_data(self):
-        signature = self.sign_transaction()
-        return signature, signed_transaction_id(self.to_dict(), signature)
-
-
 app = Flask(__name__)
+configure_trusted_proxy(app)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
 app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get(
+    'DENARIUS_COOKIE_SECURE',
+    '',
+).lower() in ('1', 'true', 'yes')
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=12)
+app.config['SESSION_COOKIE_NAME'] = 'denarius_session'
 app.secret_key = os.environ.get('DENARIUS_SECRET_KEY') or secrets.token_hex(32)
+metrics = install_runtime_controls(
+    app,
+    'denarius-console',
+    policies={
+        'healthz': None,
+        'readyz': None,
+        'login': (10, 300),
+        'register': (10, 300),
+        'api_submit_transaction': (30, 60),
+        'api_mine': (10, 60),
+        'api_automine': (30, 60),
+        'api_register_miner': (20, 60),
+        'api_register_nodes': (20, 60),
+        'api_resolve': (10, 60),
+    },
+    secure_transport=app.config['SESSION_COOKIE_SECURE'],
+)
 account_store = DenariusAccountStore(
     os.environ.get('DENARIUS_ACCOUNT_DATABASE', DEFAULT_ACCOUNT_DATABASE)
 )
@@ -158,6 +107,7 @@ def current_account():
 
 def begin_account_session(account):
     session.clear()
+    session.permanent = True
     session['account_id'] = account['id']
     ensure_csrf_token()
 
@@ -202,12 +152,53 @@ def admin_required(func):
 def csrf_required(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
+        if request.method in ('GET', 'HEAD', 'OPTIONS', 'TRACE'):
+            return func(*args, **kwargs)
         submitted_token = request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
         session_token = session.get('csrf_token')
         if not session_token or not submitted_token or not hmac.compare_digest(session_token, submitted_token):
             return jsonify({'message': 'Invalid CSRF token'}), 403
         return func(*args, **kwargs)
     return wrapper
+
+
+def metrics_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        expected_token = os.environ.get('DENARIUS_METRICS_TOKEN') or os.environ.get(ADMIN_TOKEN_ENV)
+        submitted_token = request.headers.get('X-Denarius-Metrics-Token')
+        if not expected_token or not submitted_token or not hmac.compare_digest(
+            expected_token,
+            submitted_token,
+        ):
+            return jsonify({'message': 'Metrics authentication is required'}), 403
+        return func(*args, **kwargs)
+    return wrapper
+
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    return jsonify({'status': 'alive'}), 200
+
+
+@app.route('/readyz', methods=['GET'])
+def readyz():
+    try:
+        account_store.has_admin()
+        response = requests.get(node_base_url() + '/healthz', timeout=NODE_TIMEOUT)
+        ready = response.status_code == 200
+    except (requests.RequestException, ValueError):
+        ready = False
+    return jsonify({'status': 'ready' if ready else 'not-ready'}), 200 if ready else 503
+
+
+@app.route('/metrics', methods=['GET'])
+@metrics_required
+def prometheus_metrics():
+    return Response(
+        metrics.render({'administrator_configured': int(account_store.has_admin())}),
+        content_type='text/plain; version=0.0.4',
+    )
 
 
 def relay_response(response):
@@ -218,9 +209,19 @@ def relay_response(response):
     return jsonify(payload), response.status_code
 
 
-def node_get(path):
+def node_get(path, admin=False):
+    headers = {}
+    if admin:
+        admin_token = os.environ.get(ADMIN_TOKEN_ENV)
+        if not admin_token or len(admin_token) < 32:
+            return jsonify({'message': 'DENARIUS_ADMIN_TOKEN is not configured'}), 503
+        headers['X-Denarius-Admin-Token'] = admin_token
     try:
-        response = requests.get(node_base_url() + path, timeout=NODE_TIMEOUT)
+        response = requests.get(
+            node_base_url() + path,
+            headers=headers,
+            timeout=NODE_TIMEOUT,
+        )
     except (requests.RequestException, ValueError) as exc:
         return jsonify({'message': 'Unable to reach the Denarius node', 'detail': str(exc)}), 502
     return relay_response(response)
@@ -254,6 +255,7 @@ def render_console(template_name, active_page):
         username=account['username'],
         is_admin=account['role'] == 'admin',
         wallet_scope=account['wallet_scope'],
+        csp_nonce=getattr(g, 'denarius_csp_nonce', ''),
     )
 
 @app.route('/')
@@ -312,6 +314,12 @@ def api_chain():
     return node_get('/chain')
 
 
+@app.route('/api/protocol')
+@login_required
+def api_protocol():
+    return node_get('/protocol')
+
+
 @app.route('/api/accounts/<address>')
 @login_required
 def api_account(address):
@@ -364,99 +372,23 @@ def api_mine():
     return node_post('/mine', admin=True)
 
 
+@app.route('/api/automine', methods=['GET', 'POST'])
+@admin_required
+@csrf_required
+def api_automine():
+    if request.method == 'GET':
+        return node_get('/mining/auto', admin=True)
+    action = request.form.get('action')
+    if action not in ('start', 'stop'):
+        return jsonify({'message': 'Invalid automining action'}), 400
+    return node_post('/mining/auto/' + action, admin=True)
+
+
 @app.route('/api/resolve', methods=['POST'])
 @admin_required
 @csrf_required
 def api_resolve():
     return node_post('/nodes/resolve', admin=True)
-
-
-def submitted_wallet_document():
-    wallet_json = request.form.get('wallet_document')
-    if wallet_json is not None:
-        wallet_bytes = wallet_json.encode('utf8')
-    else:
-        wallet_file = request.files.get('wallet_file')
-        if wallet_file is None:
-            raise ValueError('Encrypted wallet data is required')
-        wallet_bytes = wallet_file.read(MAX_WALLET_DOCUMENT_BYTES + 1)
-    if len(wallet_bytes) > MAX_WALLET_DOCUMENT_BYTES:
-        raise ValueError('Encrypted wallet data is too large')
-    try:
-        document = json.loads(wallet_bytes.decode('utf8'))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError('Encrypted wallet data is invalid') from exc
-    if not isinstance(document, dict):
-        raise ValueError('Encrypted wallet data is invalid')
-    return document
-
-
-@app.route('/api/wallets/new', methods=['POST'])
-@app.route('/wallet/new', methods=['POST'])
-@login_required
-@csrf_required
-def new_wallet():
-    try:
-        wallet_document = generate_encrypted_wallet(request.form.get('password', ''))
-    except ValueError as exc:
-        return jsonify({'message': str(exc)}), 400
-    response = {
-        'address': wallet_document['address'],
-        'public_key': wallet_document['public_key'],
-        'wallet': wallet_document,
-        'filename': 'denarius-' + wallet_document['address'][:14] + '.denwallet',
-    }
-    return jsonify(response), 200
-
-
-@app.route('/api/wallets/inspect', methods=['POST'])
-@app.route('/wallet/inspect', methods=['POST'])
-@login_required
-@csrf_required
-def inspect_wallet():
-    try:
-        metadata = wallet_public_metadata(submitted_wallet_document())
-    except ValueError as exc:
-        return jsonify({'message': str(exc)}), 400
-    return jsonify(metadata), 200
-
-
-@app.route('/api/transactions/sign', methods=['POST'])
-@app.route('/generate/transaction', methods=['POST'])
-@login_required
-@csrf_required
-def generate_transaction():
-    try:
-        wallet_data = decrypt_wallet(
-            submitted_wallet_document(),
-            request.form.get('password', ''),
-        )
-        sender_address = wallet_data['address']
-        sender_private_key = wallet_data['private_key']
-        recipient_address = request.form['recipient_address']
-        value = request.form['amount']
-        nonce = request.form['nonce']
-
-        transaction = Transaction(
-            sender_address,
-            sender_private_key,
-            recipient_address,
-            value,
-            nonce,
-        )
-        signature, transaction_id = transaction.signed_data()
-    except KeyError:
-        return jsonify({'message': 'Transaction details are incomplete'}), 400
-    except (binascii.Error, ValueError) as exc:
-        return jsonify({'message': str(exc) or 'Invalid transaction'}), 400
-
-    response = {
-        'transaction': transaction.to_dict(),
-        'signature': signature,
-        'transaction_id': transaction_id,
-    }
-
-    return jsonify(response), 200
 
 
 @app.route('/register', methods=['GET', 'POST'])
@@ -556,12 +488,25 @@ def main(argv=None):
         default=str(DEFAULT_ACCOUNT_DATABASE),
         help='SQLite database for console accounts',
     )
+    parser.add_argument(
+        '--development-server',
+        action='store_true',
+        help='use Flask development serving for local debugging only',
+    )
+    parser.add_argument('--threads', type=int, default=8, help='Waitress worker threads')
     args = parser.parse_args(argv)
     port = args.port
     account_store = DenariusAccountStore(args.accounts_database)
 
     node_base_url()
-    app.run(host=args.host, port=port)
+    if args.host not in ('127.0.0.1', '::1', 'localhost') and not os.environ.get('DENARIUS_SECRET_KEY'):
+        parser.error('DENARIUS_SECRET_KEY is required when the console is not loopback-only')
+    configure_json_logging('denarius-console', os.environ.get('DENARIUS_LOG_LEVEL', 'INFO'))
+    if args.development_server:
+        app.run(host=args.host, port=port)
+    else:
+        from waitress import serve
+        serve(app, host=args.host, port=port, threads=max(4, args.threads))
 
 
 if __name__ == '__main__':

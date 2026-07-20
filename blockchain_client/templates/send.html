@@ -20,14 +20,21 @@
           <input type="text" name="recipient_address" id="recipient_address" class="form-control wallet-address-input" autocomplete="off" required>
         </div>
         <div class="form-row">
-          <div class="form-group col-md-6">
+          <div class="form-group col-md-4">
             <label for="amount">Amount</label>
             <div class="input-group">
               <input type="text" name="amount" id="amount" class="form-control" inputmode="decimal" autocomplete="off" required>
               <div class="input-group-append"><span class="input-group-text">DEN</span></div>
             </div>
           </div>
-          <div class="form-group col-md-6">
+          <div class="form-group col-md-4">
+            <label for="fee">Network Fee</label>
+            <div class="input-group">
+              <input type="text" name="fee" id="fee" class="form-control" value="0.0001" inputmode="decimal" autocomplete="off" required>
+              <div class="input-group-append"><span class="input-group-text">DEN</span></div>
+            </div>
+          </div>
+          <div class="form-group col-md-4">
             <label for="wallet_password">Wallet Password</label>
             <input type="password" name="password" id="wallet_password" class="form-control" autocomplete="current-password" required>
           </div>
@@ -61,6 +68,10 @@
                 <dd id="review_amount"></dd>
               </div>
               <div class="summary-item">
+                <dt>Network Fee</dt>
+                <dd id="review_fee"></dd>
+              </div>
+              <div class="summary-item">
                 <dt>Transaction ID</dt>
                 <dd class="hash-value" id="review_transaction_id"></dd>
               </div>
@@ -68,6 +79,7 @@
             <input type="hidden" name="sender_address" id="confirmation_sender_address">
             <input type="hidden" name="recipient_address" id="confirmation_recipient_address">
             <input type="hidden" name="amount" id="confirmation_amount">
+            <input type="hidden" name="fee" id="confirmation_fee">
             <input type="hidden" name="nonce" id="transaction_nonce">
             <input type="hidden" name="signature" id="transaction_signature">
             <input type="hidden" name="transaction_id" id="transaction_id">
@@ -83,8 +95,9 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/js/wallet_crypto.js"></script>
 <script src="/static/js/wallet_store.js"></script>
-<script>
+<script nonce="{{ csp_nonce }}">
   function showSendError(message) {
     var errorBox = document.getElementById("send_error");
     errorBox.textContent = message;
@@ -136,44 +149,52 @@
       var wallet = selectedWallet();
       var recipient = document.getElementById("recipient_address").value.trim();
       var amount = document.getElementById("amount").value.trim();
+      var fee = document.getElementById("fee").value.trim();
       var password = document.getElementById("wallet_password").value;
-      if (!wallet || !recipient || !amount || !password) {
-        showSendError("Complete the sender, recipient, amount, and password fields.");
+      if (!wallet || !recipient || !amount || !fee || !password) {
+        showSendError("Complete the sender, recipient, amount, fee, and password fields.");
         return;
       }
       var button = this;
       button.disabled = true;
-      $.getJSON("/api/accounts/" + encodeURIComponent(wallet.address)).done(function (account) {
-        var signingData = new FormData(document.getElementById("transaction_form"));
-        signingData.append("wallet_document", JSON.stringify(wallet));
-        signingData.append("nonce", account.next_nonce);
-        $.ajax({
-          url: "/api/transactions/sign",
-          type: "POST",
-          data: signingData,
-          processData: false,
-          contentType: false
-        }).done(function (response) {
+      Promise.all([
+        fetch("/api/accounts/" + encodeURIComponent(wallet.address)).then(function (response) {
+          if (!response.ok) { throw new Error("Unable to read the sender account from the node."); }
+          return response.json();
+        }),
+        fetch("/api/protocol").then(function (response) {
+          if (!response.ok) { throw new Error("Unable to read the active Denarius protocol."); }
+          return response.json();
+        })
+      ]).then(function (responses) {
+        var account = responses[0];
+        var protocol = responses[1];
+        return DenariusWalletCrypto.signTransaction(wallet, password, {
+          recipient_address: recipient,
+          amount: amount,
+          fee: fee,
+          nonce: account.next_nonce
+        }, protocol);
+      }).then(function (response) {
           var transaction = response.transaction;
           document.getElementById("review_sender").textContent = transaction.sender_address;
           document.getElementById("review_recipient").textContent = transaction.recipient_address;
           document.getElementById("review_amount").textContent = DenariusConsole.formatDenarii(transaction.amount_atomic);
+          document.getElementById("review_fee").textContent = DenariusConsole.formatDenarii(transaction.fee_atomic);
           document.getElementById("review_transaction_id").textContent = response.transaction_id;
           document.getElementById("confirmation_sender_address").value = transaction.sender_address;
           document.getElementById("confirmation_recipient_address").value = transaction.recipient_address;
           document.getElementById("confirmation_amount").value = transaction.amount_atomic;
+          document.getElementById("confirmation_fee").value = transaction.fee_atomic;
           document.getElementById("transaction_nonce").value = transaction.nonce;
           document.getElementById("transaction_signature").value = response.signature;
           document.getElementById("transaction_id").value = response.transaction_id;
+          document.getElementById("wallet_password").value = "";
           $("#transaction_review").modal("show");
-        }).fail(function (error) {
-          showSendError(error.responseJSON && error.responseJSON.message ? error.responseJSON.message : "Unable to sign the transaction.");
-        }).always(function () {
-          button.disabled = false;
-        });
-      }).fail(function () {
+      }).catch(function (error) {
+        showSendError(error.message || "Unable to sign the transaction.");
+      }).finally(function () {
         button.disabled = false;
-        showSendError("Unable to read the sender account from the node.");
       });
     });
 
