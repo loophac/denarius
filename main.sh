@@ -1,1 +1,1 @@
-pip3 install -r requirements.txt && python3 blockchain/blockchain.py -p 5000
+pip3 install -r requirements.txt && python3 run_denarius.py

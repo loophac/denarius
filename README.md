@@ -25,7 +25,9 @@ Compared with the original one, we now introduce:
 - Confirmed transaction replay protection.
 - Canonical genesis block.
 - Ed25519 wallet keys, signatures, and checked addresses.
-- JSON state persistence instead of Python pickle files.
+- Transactional SQLite state persistence instead of Python pickle files.
+- Password-encrypted wallet files using scrypt and AES-256-GCM.
+- Separate node API, local administration dashboard, and wallet processes.
 - Peer table exchange, transaction relay, and newly mined block relay.
 - Basic peer request timeouts, request size limits, and mempool/block limits.
 - Password-hashed local node administration with CSRF-protected controls.
@@ -73,45 +75,53 @@ pip install -r requirements.txt
 
 ## Usage
 
-
-
-To run blockchain node:
+Start the node API, administration dashboard, and encrypted wallet together:
 
 ```bash
-python blockchain/blockchain.py -p 5000
+python run_denarius.py
 ```
 
-which also supports restoring to previous state with `-r path\to\blockchain.json`.
-The default state file is stored in `states\blockchain.json`.
+The launcher creates a temporary administration token, shares it only between
+the node and dashboard processes, and starts:
 
-The first visit to the node UI creates a local administrator. Administrative
-actions such as mining, changing the reward address, adding peers, and manually
-resolving the chain require that signed-in session. Passwords must be at least
-10 characters and are held as salted hashes for the lifetime of the process.
-Set `DENARIUS_SECRET_KEY` in a managed deployment instead of relying on the
-random session-signing secret generated at startup. Administrator registration
-is intentionally local and must currently be repeated after a process restart.
+- Node API: `http://127.0.0.1:5000`
+- Administration dashboard: `http://127.0.0.1:5001`
+- Encrypted wallet: `http://127.0.0.1:8080`
+
+Node state is stored transactionally in `states/denarius.db`. SQLite keeps
+blocks, pending transactions, peers, and node metadata in separate tables and
+uses full synchronous writes with write-ahead logging.
+
+The three services can also be run independently:
+
+```bash
+export DENARIUS_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+python blockchain/blockchain.py --port 5000 --database states/denarius.db
+python node_dashboard/dashboard.py --port 5001
+python blockchain_client/blockchain_client.py --port 8080
+```
+
+Use the same `DENARIUS_ADMIN_TOKEN` for the node and dashboard when starting
+them independently. The browser never receives this token. The dashboard keeps
+its local login and CSRF checks, then forwards authorized administration calls
+to the node. Set `DENARIUS_SECRET_KEY` for a stable dashboard session key.
 
 Phase 1 uses protocol version 2, account nonces, transaction IDs, Merkle roots,
 and deterministic proof-of-work targets. State files created by Phase 0 or
 older versions use a different consensus format and are intentionally rejected.
-Archive an old state file and start without `-r` to create a fresh Phase 1
-chain.
-
-To run blockchain client:
+Archive an older state file and start without it to create a fresh Phase 1
+chain. Phase 2 does not change consensus or require another chain reset. A valid
+Phase 1 JSON state can be migrated into SQLite:
 
 ```bash
-python blockchain_client/blockchain_client.py -p 8080
+python blockchain/blockchain.py --migrate-json states/blockchain.json --database states/denarius.db
 ```
 
-The wallet UI generates an Ed25519 private key, raw public key, and checked
-Denarius address. Use the checked address for sender, recipient, and miner
-fields. The wallet UI accepts ordinary DEN amounts and normalizes them to atomic
-units before signing. Before creating a signature, the wallet reads the sender's
-next nonce from the selected node. The node's `/transactions/new` endpoint
-expects `sender_address`, `recipient_address`, `amount` (in atomic units),
-`nonce`, `signature`, and `transaction_id`. Account balance and nonce state are
-available from `GET /accounts/<address>`.
+The wallet creates an Ed25519 key, encrypts it with scrypt and AES-256-GCM, and
+downloads a `.denwallet` file. Raw private keys are never returned to the web
+page. To send DEN, select the encrypted wallet file and enter its password; the
+local wallet process decrypts it in memory, reads the next account nonce from
+the selected node, and uses the plaintext key only for that signing request.
 
 To run the tests:
 
@@ -122,13 +132,15 @@ pytest
 The regression tests cover monetary policy, canonical transaction IDs, account
 nonces, forged signatures, invalid amounts, pending double-spends, invalid
 genesis blocks, incorrect and duplicate coinbase rewards, malformed peer
-responses, Merkle commitments, deterministic targets, exact chainwork, JSON
-state loading, and Denarii display formatting.
+responses, Merkle commitments, deterministic targets, exact chainwork, SQLite
+state loading and migration, authenticated wallet encryption, process
+separation, and Denarii display formatting.
 
 ## Security notes
 
 Denarius remains educational software. The node binds to `127.0.0.1` by default.
-Do not expose the Flask development server directly to the internet. Private
-wallet and TLS key files are ignored and must never be committed. The historical
-example keys previously included in this repository should be considered public
-and must not be reused.
+Do not expose the Flask development servers directly to the internet. Encrypted
+wallet files, SQLite state files, private keys, and TLS key files are ignored
+and must never be committed. A `.denwallet` file still controls funds when paired
+with its password; back up both separately. Historical example keys previously
+included in this repository should be considered public and must not be reused.

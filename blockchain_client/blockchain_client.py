@@ -20,7 +20,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import binascii
-import hashlib
+import json
 import sys
 
 from cryptography.hazmat.primitives import serialization
@@ -38,6 +38,14 @@ from denarius_protocol import (
     signed_transaction_id,
     transaction_signing_payload,
 )
+from denarius_crypto import (
+    address_from_public_key,
+    decrypt_wallet,
+    generate_encrypted_wallet,
+    wallet_public_metadata,
+)
+
+MAX_WALLET_FILE_BYTES = 64 * 1024
 
 
 class Transaction:
@@ -103,14 +111,9 @@ class Transaction:
         return signature, signed_transaction_id(self.to_dict(), signature)
 
 
-def address_from_public_key(public_key_bytes):
-    public_key_hex = binascii.hexlify(public_key_bytes).decode('ascii')
-    checksum = hashlib.sha256(('DENARIUS:' + public_key_hex).encode('ascii')).hexdigest()[:8]
-    return 'dn' + public_key_hex + checksum
-
-
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+app.config['MAX_CONTENT_LENGTH'] = 256 * 1024
 
 @app.route('/')
 def index():
@@ -127,33 +130,55 @@ def view_transaction():
     return render_template('./view_transactions.html')
 
 
-@app.route('/wallet/new', methods=['GET'])
-def new_wallet():
-    private_key = ed25519.Ed25519PrivateKey.generate()
-    public_key = private_key.public_key()
-    private_key_bytes = private_key.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    public_key_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-    response = {
-        'private_key': binascii.hexlify(private_key_bytes).decode('ascii'),
-        'public_key': binascii.hexlify(public_key_bytes).decode('ascii'),
-        'address': address_from_public_key(public_key_bytes),
-    }
+def uploaded_wallet_document():
+    wallet_file = request.files.get('wallet_file')
+    if wallet_file is None:
+        raise ValueError('Encrypted wallet file is required')
+    wallet_bytes = wallet_file.read(MAX_WALLET_FILE_BYTES + 1)
+    if len(wallet_bytes) > MAX_WALLET_FILE_BYTES:
+        raise ValueError('Encrypted wallet file is too large')
+    try:
+        document = json.loads(wallet_bytes.decode('utf8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError('Encrypted wallet file is invalid') from exc
+    if not isinstance(document, dict):
+        raise ValueError('Encrypted wallet file is invalid')
+    return document
 
+
+@app.route('/wallet/new', methods=['POST'])
+def new_wallet():
+    try:
+        wallet_document = generate_encrypted_wallet(request.form.get('password', ''))
+    except ValueError as exc:
+        return jsonify({'message': str(exc)}), 400
+    response = {
+        'address': wallet_document['address'],
+        'public_key': wallet_document['public_key'],
+        'wallet': wallet_document,
+        'filename': 'denarius-' + wallet_document['address'][:14] + '.denwallet',
+    }
     return jsonify(response), 200
+
+
+@app.route('/wallet/inspect', methods=['POST'])
+def inspect_wallet():
+    try:
+        metadata = wallet_public_metadata(uploaded_wallet_document())
+    except ValueError as exc:
+        return jsonify({'message': str(exc)}), 400
+    return jsonify(metadata), 200
 
 
 @app.route('/generate/transaction', methods=['POST'])
 def generate_transaction():
     try:
-        sender_address = request.form['sender_address']
-        sender_private_key = request.form['sender_private_key']
+        wallet_data = decrypt_wallet(
+            uploaded_wallet_document(),
+            request.form.get('password', ''),
+        )
+        sender_address = wallet_data['address']
+        sender_private_key = wallet_data['private_key']
         recipient_address = request.form['recipient_address']
         value = request.form['amount']
         nonce = request.form['nonce']

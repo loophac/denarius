@@ -51,9 +51,8 @@
 
 
           <div class="card-body">
-            <h4 class="card-title">Wallet Generator</h4>
-            <p class="card-text">Click on the button below to generate your blockchain wallet</p>
-            <input type="button" class="btn btn-primary btn-lg" value="Generate Wallet">
+            <h4 class="card-title">Create Encrypted Wallet</h4>
+            <p class="card-text">Protect a new Denarii wallet with a password.</p>
           </div>
 
         </div>
@@ -62,7 +61,37 @@
 
     <br>
 
-    <div class="container">
+    <div class="container alert alert-secondary">
+
+        <div class="row">
+          <label class="col-sm-2" for="wallet_password">Password:</label>
+          <div class="col-sm-10">
+            <input type="password" id="wallet_password" class="form-control" minlength="10" autocomplete="new-password">
+          </div>
+        </div>
+
+        <br>
+
+        <div class="row">
+          <label class="col-sm-2" for="wallet_password_confirm">Confirm Password:</label>
+          <div class="col-sm-10">
+            <input type="password" id="wallet_password_confirm" class="form-control" minlength="10" autocomplete="new-password">
+          </div>
+        </div>
+
+        <br>
+
+        <div class="row">
+          <div class="col-sm-12 text-center">
+            <button type="button" id="generate_wallet" class="btn btn-primary btn-lg">Create Wallet</button>
+          </div>
+        </div>
+
+        <div id="wallet_error" class="alert alert-danger mt-3" role="alert" style="display:none"></div>
+
+    </div>
+
+    <div class="container" id="wallet_result" style="display:none">
 
         <div class="row">
           <label class="col-sm-2">Address:</label>
@@ -76,28 +105,27 @@
         <div class="row">
           <label class="col-sm-2">Public Key:</label>
           <div class="col-sm-10">
-            <textarea id="public_key" rows="5" class="form-control" readonly></textarea>
+            <textarea id="public_key" rows="3" class="form-control" readonly></textarea>
           </div>
         </div>
 
         <br>
         
         <div class="row">
-          <label class="col-sm-2">Private Key:</label>
-          <div class="col-sm-10">
-            <textarea id="private_key" rows="5" class="form-control" readonly></textarea>
+          <div class="col-sm-12 text-center">
+            <button type="button" id="download_wallet" class="btn btn-success btn-lg">Download Wallet</button>
           </div>
         </div>
 
         <br>
 
-        <div class="row" id="warning" style="display:none">
+        <div class="row" id="warning">
           <div class="col-sm-12">
-            <div class="alert alert-danger" role="alert">
+            <div class="alert alert-warning" role="alert">
               IMPORTANT
               <ul>
-                <li>Save your address and private key. These keys cannot be recovered!</li>
-                <li>Don't share your private key with anyone!</li>
+                <li>Keep the downloaded wallet file and password in separate safe locations.</li>
+                <li>Neither can be recovered if lost.</li>
               </ul> 
             </div>
           </div>
@@ -116,22 +144,52 @@
 
     <script>
 
+      var walletDocument = null;
+      var walletFilename = "denarius-wallet.denwallet";
+
       $(function(){
-        $('input').click(function(){
+        $('#generate_wallet').click(function(){
+          var password = document.getElementById("wallet_password").value;
+          var confirmation = document.getElementById("wallet_password_confirm").value;
+          var errorBox = document.getElementById("wallet_error");
+          errorBox.style.display = "none";
+          if (password.length < 10 || password !== confirmation) {
+            errorBox.textContent = "Passwords must match and contain at least 10 characters.";
+            errorBox.style.display = "block";
+            return;
+          }
 
           $.ajax({
             url: '/wallet/new',
-            type: 'GET',
+            type: 'POST',
+            data: {password: password},
             success: function(response){
-              document.getElementById("private_key").innerHTML = response['private_key'];
-              document.getElementById("public_key").innerHTML = response['public_key'];
-              document.getElementById("address").innerHTML = response['address'];
-              document.getElementById("warning").style.display = "block";
+              walletDocument = response['wallet'];
+              walletFilename = response['filename'];
+              document.getElementById("public_key").value = response['public_key'];
+              document.getElementById("address").value = response['address'];
+              document.getElementById("wallet_result").style.display = "block";
             },
             error: function(error){
               console.log(error);
+              errorBox.textContent = error.responseJSON && error.responseJSON.message
+                ? error.responseJSON.message
+                : "Unable to create the encrypted wallet.";
+              errorBox.style.display = "block";
             }
           });
+        });
+
+        $('#download_wallet').click(function(){
+          if (!walletDocument) {
+            return;
+          }
+          var blob = new Blob([JSON.stringify(walletDocument, null, 2)], {type: "application/json"});
+          var link = document.createElement("a");
+          link.href = URL.createObjectURL(blob);
+          link.download = walletFilename;
+          link.click();
+          URL.revokeObjectURL(link.href);
         });
       })
 

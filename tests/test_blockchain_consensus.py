@@ -3,7 +3,9 @@ import binascii
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import sys
 import types
@@ -16,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "blockchain" / "blockchain.py"
 CLIENT_MODULE_PATH = ROOT / "blockchain_client" / "blockchain_client.py"
+DASHBOARD_MODULE_PATH = ROOT / "node_dashboard" / "dashboard.py"
 
 
 def install_flask_stubs():
@@ -75,10 +78,16 @@ client_spec = importlib.util.spec_from_file_location("denarius_client", CLIENT_M
 denarius_client = importlib.util.module_from_spec(client_spec)
 client_spec.loader.exec_module(denarius_client)
 
+dashboard_spec = importlib.util.spec_from_file_location("denarius_dashboard", DASHBOARD_MODULE_PATH)
+denarius_dashboard = importlib.util.module_from_spec(dashboard_spec)
+dashboard_spec.loader.exec_module(denarius_dashboard)
+
 Blockchain = denarius_blockchain.Blockchain
 Transaction = denarius_client.Transaction
 
 import denarius_protocol
+import denarius_crypto
+from denarius_storage import migrate_json_state
 
 
 def mine_block(blockchain):
@@ -388,34 +397,57 @@ def test_block_metadata_is_bound_to_proof_of_work():
     assert blockchain.valid_proof(altered_block) is False
 
 
-def test_state_is_saved_and_loaded_as_json():
+def test_state_is_saved_and_loaded_from_sqlite():
     blockchain, miner_address, _ = funded_blockchain()
     blockchain.miner_name = "miner"
     blockchain.nodes.add("127.0.0.1:5001")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        state_path = Path(tmpdir) / "blockchain.json"
+        state_path = Path(tmpdir) / "denarius.db"
         blockchain.STATE_PATH = state_path
         blockchain.save_everything()
 
         restored = Blockchain().load_everything(state_path)
+
+        connection = sqlite3.connect(state_path)
+        try:
+            tables = {
+                name for name, in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            connection.close()
 
     assert restored.chain == blockchain.chain
     assert restored.node_address == miner_address
     assert restored.miner_name == "miner"
     assert restored.nodes == {"127.0.0.1:5001"}
 
+    assert {"metadata", "blocks", "pending_transactions", "peers"} <= tables
+
 
 def test_state_loader_rejects_a_tampered_chain():
     blockchain, _, _ = funded_blockchain()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        state_path = Path(tmpdir) / "blockchain.json"
+        state_path = Path(tmpdir) / "denarius.db"
         blockchain.STATE_PATH = state_path
         blockchain.save_everything()
-        state = json.loads(state_path.read_text())
-        state["chain"][-1]["timestamp"] += 1
-        state_path.write_text(json.dumps(state))
+        connection = sqlite3.connect(state_path)
+        try:
+            block_json = connection.execute(
+                "SELECT block_json FROM blocks WHERE height = 1"
+            ).fetchone()[0]
+            block = json.loads(block_json)
+            block["timestamp"] += 1
+            connection.execute(
+                "UPDATE blocks SET block_json = ? WHERE height = 1",
+                (json.dumps(block),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
         try:
             Blockchain().load_everything(state_path)
@@ -447,39 +479,33 @@ def test_mining_reserves_space_for_coinbase_and_leaves_overflow_pending():
 
 def test_local_admin_passwords_are_salted_and_verified():
     password = "correct horse battery staple"
-    first_hash = denarius_blockchain.hash_password(password)
-    second_hash = denarius_blockchain.hash_password(password)
+    first_hash = denarius_dashboard.hash_password(password)
+    second_hash = denarius_dashboard.hash_password(password)
 
     assert first_hash != second_hash
-    assert denarius_blockchain.verify_password(password, first_hash) is True
-    assert denarius_blockchain.verify_password("wrong password", first_hash) is False
+    assert denarius_dashboard.verify_password(password, first_hash) is True
+    assert denarius_dashboard.verify_password("wrong password", first_hash) is False
 
 
-def test_admin_mining_requires_login_and_csrf():
-    original_user = denarius_blockchain.registered_user
-    original_session = dict(denarius_blockchain.session)
+def test_node_mining_requires_admin_token():
     original_headers = denarius_blockchain.request.headers
     try:
-        denarius_blockchain.registered_user = {
-            "username": "admin",
-            "password_hash": denarius_blockchain.hash_password("a secure password"),
-        }
-        denarius_blockchain.session.clear()
-        assert denarius_blockchain.mine() == "login"
-
-        denarius_blockchain.session.update({"user": "admin", "csrf_token": "expected"})
         denarius_blockchain.request.headers = {}
-        _, status = denarius_blockchain.mine()
-        assert status == 403
-
-        denarius_blockchain.request.headers = {"X-CSRF-Token": "expected"}
-        with patch.object(denarius_blockchain.blockchain, "mine_pending_transactions", return_value=False):
+        with patch.dict(os.environ, {}, clear=True):
             _, status = denarius_blockchain.mine()
-        assert status == 406
+            assert status == 503
+
+        token = "a" * 32
+        with patch.dict(os.environ, {"DENARIUS_ADMIN_TOKEN": token}, clear=False):
+            denarius_blockchain.request.headers = {"X-Denarius-Admin-Token": "wrong"}
+            _, status = denarius_blockchain.mine()
+            assert status == 403
+
+            denarius_blockchain.request.headers = {"X-Denarius-Admin-Token": token}
+            with patch.object(denarius_blockchain.blockchain, "mine_pending_transactions", return_value=False):
+                _, status = denarius_blockchain.mine()
+            assert status == 406
     finally:
-        denarius_blockchain.registered_user = original_user
-        denarius_blockchain.session.clear()
-        denarius_blockchain.session.update(original_session)
         denarius_blockchain.request.headers = original_headers
 
 
@@ -707,3 +733,92 @@ def test_retarget_is_deterministic_and_time_bounded():
 
     assert blockchain.expected_target(chain, denarius_protocol.RETARGET_INTERVAL) == expected
     assert blockchain.expected_target(chain, denarius_protocol.RETARGET_INTERVAL - 1) == denarius_protocol.INITIAL_TARGET
+
+
+def test_wallet_file_encrypts_private_key_and_rejects_wrong_password():
+    password = "a strong wallet password"
+    wallet_document = denarius_crypto.generate_encrypted_wallet(password)
+
+    assert set(wallet_document) == set(denarius_crypto.WALLET_FIELDS)
+    assert "private_key" not in wallet_document
+    wallet_data = denarius_crypto.decrypt_wallet(wallet_document, password)
+    assert wallet_data["address"] == wallet_document["address"]
+    assert len(wallet_data["private_key"]) == 64
+
+    try:
+        denarius_crypto.decrypt_wallet(wallet_document, "the wrong password")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("encrypted wallet accepted the wrong password")
+
+
+def test_wallet_ciphertext_detects_tampering():
+    wallet_document = denarius_crypto.generate_encrypted_wallet("another strong password")
+    tampered = copy.deepcopy(wallet_document)
+    tampered["ciphertext"] = (
+        "00" if tampered["ciphertext"][:2] != "00" else "11"
+    ) + tampered["ciphertext"][2:]
+
+    try:
+        denarius_crypto.decrypt_wallet(tampered, "another strong password")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("tampered wallet ciphertext was decrypted")
+
+
+def test_phase_one_json_state_can_migrate_to_sqlite():
+    blockchain, _, _ = funded_blockchain()
+    state = {
+        "chain": blockchain.chain,
+        "transactions": blockchain.transactions,
+        "nodes": sorted(blockchain.nodes),
+        "node_address": blockchain.node_address,
+        "miner_name": blockchain.miner_name,
+        "mining_target": denarius_protocol.target_to_hex(blockchain.MINING_TARGET),
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        json_path = Path(tmpdir) / "phase-one.json"
+        database_path = Path(tmpdir) / "denarius.db"
+        json_path.write_text(json.dumps(state), encoding="utf8")
+        migrate_json_state(json_path, database_path)
+        restored = Blockchain().load_everything(database_path)
+
+    assert restored.chain == blockchain.chain
+    assert restored.node_address == blockchain.node_address
+
+
+def test_json_migration_rejects_incomplete_state():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        json_path = Path(tmpdir) / "incomplete.json"
+        database_path = Path(tmpdir) / "denarius.db"
+        json_path.write_text(json.dumps({"chain": []}), encoding="utf8")
+
+        try:
+            migrate_json_state(json_path, database_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("incomplete JSON state was migrated")
+
+
+def test_wallet_ui_never_requests_or_displays_raw_private_keys():
+    create_template = (ROOT / "blockchain_client" / "templates" / "index.html").read_text()
+    send_template = (ROOT / "blockchain_client" / "templates" / "make_transaction.html").read_text()
+
+    assert "private_key" not in create_template
+    assert "sender_private_key" not in send_template
+    assert 'name="wallet_file"' in send_template
+    assert "/wallet/inspect" in send_template
+
+
+def test_node_and_dashboard_are_separate_process_boundaries():
+    node_source = MODULE_PATH.read_text()
+    dashboard_source = DASHBOARD_MODULE_PATH.read_text()
+
+    assert "render_template" not in node_source
+    assert "X-Denarius-Admin-Token" in node_source
+    assert "X-Denarius-Admin-Token" in dashboard_source
+    assert "render_template" in dashboard_source

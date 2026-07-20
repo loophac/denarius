@@ -1,10 +1,7 @@
 import binascii
 import copy
-import hashlib
 import hmac
-import json
 import os
-import secrets
 import sys
 import threading
 from collections import OrderedDict
@@ -18,7 +15,7 @@ from uuid import uuid1
 import requests
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from flask import Flask, jsonify, request, render_template, redirect, session, url_for
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +51,8 @@ from denarius_protocol import (
     transaction_signing_payload,
     work_for_target,
 )
+from denarius_crypto import address_from_public_key, public_key_from_address
+from denarius_storage import DenariusStorage, migrate_json_state
 
 class Blockchain:
     PROTOCOL_VERSION = PROTOCOL_VERSION
@@ -68,7 +67,7 @@ class Blockchain:
     MAX_PENDING_TRANSACTIONS = 1000
     MAX_TRANSACTIONS_PER_BLOCK = 1000
     GENESIS_BLOCK = GENESIS_BLOCK
-    STATE_PATH = Path(__file__).resolve().parents[1] / 'states' / 'blockchain.json'
+    STATE_PATH = Path(__file__).resolve().parents[1] / 'states' / 'denarius.db'
 
     def __init__(self, name="THE BLOCKCHAIN"):
 
@@ -253,24 +252,10 @@ class Blockchain:
         return canonical_json_bytes(transaction)
 
     def address_from_public_key(self, public_key_bytes):
-        public_key_hex = binascii.hexlify(public_key_bytes).decode('ascii')
-        checksum = hashlib.sha256(('DENARIUS:' + public_key_hex).encode('ascii')).hexdigest()[:8]
-        return 'dn' + public_key_hex + checksum
+        return address_from_public_key(public_key_bytes)
 
     def public_key_from_address(self, address):
-        if not isinstance(address, str) or len(address) != 74 or not address.startswith('dn'):
-            return None
-
-        public_key_hex = address[2:66]
-        checksum = address[66:]
-        expected_checksum = hashlib.sha256(('DENARIUS:' + public_key_hex).encode('ascii')).hexdigest()[:8]
-        if checksum != expected_checksum:
-            return None
-
-        try:
-            return binascii.unhexlify(public_key_hex)
-        except (ValueError, TypeError, binascii.Error):
-            return None
+        return public_key_from_address(address)
 
     def verify_transaction_signature(self, sender_address, signature, transaction):
         """
@@ -836,27 +821,12 @@ class Blockchain:
                 'miner_name': self.miner_name,
                 'mining_target': target_to_hex(self.MINING_TARGET),
             }
-
-        self.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.STATE_PATH.with_suffix(self.STATE_PATH.suffix + '.tmp')
-        with temporary_path.open('w', encoding='utf8') as state_file:
-            json.dump(state, state_file, sort_keys=True, allow_nan=False)
-            state_file.flush()
-            os.fsync(state_file.fileno())
-        os.replace(temporary_path, self.STATE_PATH)
+        DenariusStorage(self.STATE_PATH).save_state(state)
 
 
     def load_everything(self, path):
         state_path = Path(path).resolve()
-        try:
-            with state_path.open('r', encoding='utf8') as f:
-                state = json.load(f)
-        except FileNotFoundError as exc:
-            raise ValueError('State file does not exist') from exc
-        except json.JSONDecodeError as exc:
-            raise ValueError('State file is not valid JSON') from exc
-        if not isinstance(state, dict):
-            raise ValueError('State file must contain a JSON object')
+        state = DenariusStorage(state_path).load_state()
 
         chain = state.get('chain')
         if not self.valid_chain(chain):
@@ -916,9 +886,6 @@ class Blockchain:
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.secret_key = os.environ.get('DENARIUS_SECRET_KEY') or secrets.token_hex(32)
 CORS(app, resources={
     r'/chain': {'origins': '*'},
     r'/miner/get': {'origins': '*'},
@@ -929,65 +896,20 @@ CORS(app, resources={
 })
 
 blockchain = Blockchain()
-registered_user = None
-PASSWORD_ITERATIONS = 240000
+ADMIN_TOKEN_ENV = 'DENARIUS_ADMIN_TOKEN'
 
 
-def hash_password(password):
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf8'), salt, PASSWORD_ITERATIONS)
-    return salt.hex() + ':' + digest.hex()
-
-
-def verify_password(password, encoded_password):
-    try:
-        salt_hex, expected_hex = encoded_password.split(':', 1)
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(expected_hex)
-    except (AttributeError, TypeError, ValueError):
-        return False
-    actual = hashlib.pbkdf2_hmac('sha256', password.encode('utf8'), salt, PASSWORD_ITERATIONS)
-    return hmac.compare_digest(actual, expected)
-
-
-def ensure_csrf_token():
-    if 'csrf_token' not in session:
-        session['csrf_token'] = secrets.token_hex(32)
-    return session['csrf_token']
-
-
-def login_required(func):
+def admin_required(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
-        if registered_user is None:
-            return redirect(url_for('register'))
-        if 'user' not in session:
-            return redirect(url_for('login'))
+        expected_token = os.environ.get(ADMIN_TOKEN_ENV)
+        if not expected_token or len(expected_token) < 32:
+            return jsonify({'message': 'Node administration is not configured'}), 503
+        submitted_token = request.headers.get('X-Denarius-Admin-Token')
+        if not submitted_token or not hmac.compare_digest(expected_token, submitted_token):
+            return jsonify({'message': 'Invalid node administration token'}), 403
         return func(*args, **kwargs)
     return wrapper
-
-
-def csrf_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        submitted_token = request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
-        session_token = session.get('csrf_token')
-        if not session_token or not submitted_token or not hmac.compare_digest(session_token, submitted_token):
-            return jsonify({'message': 'Invalid CSRF token'}), 403
-        return func(*args, **kwargs)
-    return wrapper
-
-
-@app.route('/')
-@login_required
-def index():
-    return render_template('index.html', csrf_token=ensure_csrf_token())
-
-
-@app.route('/configure')
-@login_required
-def configure():
-    return render_template('./configure.html', csrf_token=ensure_csrf_token())
 
 
 @app.route('/transactions/new', methods=['POST'])
@@ -1074,8 +996,7 @@ def full_chain():
 
 
 @app.route('/mine', methods=['POST'])
-@login_required
-@csrf_required
+@admin_required
 def mine():
     block = blockchain.mine_pending_transactions()
     if block is False:
@@ -1108,8 +1029,7 @@ def receive_block():
 
 
 @app.route('/miner/register', methods=['POST'])
-@login_required
-@csrf_required
+@admin_required
 def register_miner():
     values = request.form
     address = values.get('address')
@@ -1133,8 +1053,7 @@ def register_miner():
 
 
 @app.route('/nodes/register', methods=['POST'])
-@login_required
-@csrf_required
+@admin_required
 def register_nodes():
     values = request.form
     submitted_nodes = values.get('nodes')
@@ -1162,8 +1081,7 @@ def register_nodes():
 
 
 @app.route('/nodes/resolve', methods=['POST'])
-@login_required
-@csrf_required
+@admin_required
 def consensus():
     replaced = blockchain.resolve_conflicts()
 
@@ -1199,69 +1117,33 @@ def get_miner_info():
                 }
     return jsonify(response), 200
 
-
-
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    global registered_user
-    if registered_user:
-        return redirect(url_for('login'))
-    if request.method == 'POST':
-        submitted_token = request.form.get('csrf_token')
-        if not submitted_token or not hmac.compare_digest(ensure_csrf_token(), submitted_token):
-            return 'Invalid CSRF token', 403
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '')
-        if not username or len(username) > 64 or len(password) < 10:
-            return 'Username is required and password must be at least 10 characters', 400
-        registered_user = {'username': username, 'password_hash': hash_password(password)}
-        session.clear()
-        session['user'] = username
-        ensure_csrf_token()
-        return redirect(url_for('index'))
-    return render_template('register.html', csrf_token=ensure_csrf_token())
-
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        submitted_token = request.form.get('csrf_token')
-        if not submitted_token or not hmac.compare_digest(ensure_csrf_token(), submitted_token):
-            return 'Invalid CSRF token', 403
-        username = request.form.get('username', '')
-        password = request.form.get('password', '')
-        if (registered_user and username == registered_user['username']
-                and verify_password(password, registered_user['password_hash'])):
-            session.clear()
-            session['user'] = username
-            ensure_csrf_token()
-            return redirect(url_for('index'))
-        return 'Invalid credentials', 403
-    return render_template('login.html', csrf_token=ensure_csrf_token())
-
-
-@app.route('/logout')
-def logout():
-    session.pop('user', None)
-    return redirect(url_for('login'))
-
-
-
 if __name__ == '__main__':
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
     parser.add_argument('-p', '--port', default=5000, type=int, help='port to listen on')
-    parser.add_argument('-r', '--resume', default=None, type=str, help='resume to a certain state')
+    parser.add_argument(
+        '-d', '--database',
+        default=str(Blockchain.STATE_PATH),
+        help='SQLite state database path',
+    )
+    parser.add_argument(
+        '--migrate-json',
+        default=None,
+        help='migrate a Phase 1 JSON state file into the selected database',
+    )
     args = parser.parse_args()
     port = args.port
-    path = args.resume
-
-    # resume to the state
-    if path:
+    database_path = Path(args.database).resolve()
+    if args.migrate_json:
         try:
-            blockchain = blockchain.load_everything(path)
+            migrate_json_state(args.migrate_json, database_path)
+        except ValueError as exc:
+            parser.error(str(exc))
+    blockchain.STATE_PATH = database_path
+    if database_path.exists():
+        try:
+            blockchain = blockchain.load_everything(database_path)
         except ValueError as exc:
             parser.error(str(exc))
 

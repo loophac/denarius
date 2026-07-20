@@ -5,7 +5,11 @@ __pycache__/
 *.py[cod]
 states/*.json
 states/*.json.tmp
+states/*.db
+states/*.db-wal
+states/*.db-shm
 certificates/
 *.key
 *.pem
 *.p12
+*.denwallet
