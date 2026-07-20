@@ -57,6 +57,7 @@ from denarius_protocol import (
 )
 from denarius_crypto import address_from_public_key, public_key_from_address
 from denarius_network import PeerNetwork, protocol_identity
+from denarius_paths import state_path
 from denarius_storage import DenariusStorage, migrate_json_state
 
 class Blockchain:
@@ -75,7 +76,7 @@ class Blockchain:
     MAX_PENDING_TRANSACTIONS = 1000
     MAX_TRANSACTIONS_PER_BLOCK = 1000
     GENESIS_BLOCK = GENESIS_BLOCK
-    STATE_PATH = Path(__file__).resolve().parents[1] / 'states' / 'denarius.db'
+    STATE_PATH = state_path('denarius.db')
 
     def __init__(self, name="THE BLOCKCHAIN"):
 
@@ -1515,7 +1516,9 @@ def get_miner_info():
                 }
     return jsonify(response), 200
 
-if __name__ == '__main__':
+def main(argv=None):
+    global blockchain
+
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
@@ -1542,7 +1545,7 @@ if __name__ == '__main__':
         default=None,
         help='host and port shared with peers (defaults to 127.0.0.1 and --port)',
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     port = args.port
     database_path = Path(args.database).resolve()
     if args.migrate_json:
@@ -1571,3 +1574,7 @@ if __name__ == '__main__':
         app.run(host=args.host, port=port)
     finally:
         blockchain.stop_background_sync()
+
+
+if __name__ == '__main__':
+    main()

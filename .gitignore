@@ -1,8 +1,15 @@
 .test_deps/
 .verify_deps/
+.phase5_deps/
+.venv/
 .pytest_cache/
 __pycache__/
 *.py[cod]
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 states/*.json
 states/*.json.tmp
 states/*.db

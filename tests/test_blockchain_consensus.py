@@ -21,6 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "blockchain" / "blockchain.py"
 CLIENT_MODULE_PATH = ROOT / "blockchain_client" / "blockchain_client.py"
 DASHBOARD_MODULE_PATH = ROOT / "node_dashboard" / "dashboard.py"
+STUBBED_MODULE_NAMES = ("flask", "flask_cors", "requests")
+ORIGINAL_MODULES = {
+    name: sys.modules.get(name)
+    for name in STUBBED_MODULE_NAMES
+}
 
 
 def install_flask_stubs():
@@ -87,6 +92,12 @@ client_spec.loader.exec_module(denarius_client)
 dashboard_spec = importlib.util.spec_from_file_location("denarius_dashboard", DASHBOARD_MODULE_PATH)
 denarius_dashboard = importlib.util.module_from_spec(dashboard_spec)
 dashboard_spec.loader.exec_module(denarius_dashboard)
+
+for module_name, original_module in ORIGINAL_MODULES.items():
+    if original_module is None:
+        sys.modules.pop(module_name, None)
+    else:
+        sys.modules[module_name] = original_module
 
 Blockchain = denarius_blockchain.Blockchain
 Transaction = denarius_client.Transaction
@@ -1141,7 +1152,8 @@ def test_node_and_console_are_separate_process_boundaries():
     assert "X-Denarius-Admin-Token" in console_source
     assert "render_template" in console_source
     assert "node_dashboard/dashboard.py" not in launcher_source
-    assert "blockchain_client/blockchain_client.py" in launcher_source
+    assert "blockchain.blockchain" in launcher_source
+    assert "blockchain_client.blockchain_client" in launcher_source
     assert "--accounts-database" in launcher_source
     assert "--console-host" in launcher_source
 

@@ -7,16 +7,17 @@ import time
 from pathlib import Path
 
 from denarius_accounts import DenariusAccountStore
+from denarius_paths import state_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def command(script, port, *extra):
-    return [sys.executable, str(PROJECT_ROOT / script), '--port', str(port), *extra]
+def command(module, port, *extra):
+    return [sys.executable, '-m', module, '--port', str(port), *extra]
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description='Run the Denarius node and local console')
     parser.add_argument('--node-port', type=int, default=5000)
     parser.add_argument('--console-port', '--wallet-port', dest='console_port', type=int, default=8080)
@@ -26,13 +27,13 @@ def main():
     parser.add_argument('--advertise-address', default=None)
     parser.add_argument(
         '--database',
-        default=str(PROJECT_ROOT / 'states' / 'denarius.db'),
+        default=str(state_path('denarius.db')),
     )
     parser.add_argument(
         '--accounts-database',
-        default=str(PROJECT_ROOT / 'states' / 'console-accounts.db'),
+        default=str(state_path('console-accounts.db')),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     environment = os.environ.copy()
     environment.setdefault('DENARIUS_ADMIN_TOKEN', secrets.token_hex(32))
@@ -44,7 +45,7 @@ def main():
 
     services = [
         command(
-            'blockchain/blockchain.py',
+            'blockchain.blockchain',
             args.node_port,
             '--database', args.database,
             '--sync-interval', str(args.sync_interval),
@@ -52,7 +53,7 @@ def main():
             '--advertise-address', args.advertise_address or ('127.0.0.1:' + str(args.node_port)),
         ),
         command(
-            'blockchain_client/blockchain_client.py',
+            'blockchain_client.blockchain_client',
             args.console_port,
             '--host', args.console_host,
             '--accounts-database', args.accounts_database,

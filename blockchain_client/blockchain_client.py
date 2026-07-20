@@ -33,6 +33,7 @@ from denarius_crypto import (
     wallet_public_metadata,
 )
 from denarius_accounts import DenariusAccountStore
+from denarius_paths import state_path
 
 MAX_WALLET_DOCUMENT_BYTES = 64 * 1024
 PASSWORD_ITERATIONS = 240000
@@ -40,7 +41,7 @@ DUMMY_PASSWORD_HASH = ('00' * 16) + ':' + ('00' * 32)
 NODE_TIMEOUT = 5
 ADMIN_TOKEN_ENV = 'DENARIUS_ADMIN_TOKEN'
 SETUP_TOKEN_ENV = 'DENARIUS_SETUP_TOKEN'
-DEFAULT_ACCOUNT_DATABASE = PROJECT_ROOT / 'states' / 'console-accounts.db'
+DEFAULT_ACCOUNT_DATABASE = state_path('console-accounts.db')
 USERNAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$')
 
 
@@ -542,7 +543,9 @@ def logout():
     return redirect(url_for('login'))
 
 
-if __name__ == '__main__':
+def main(argv=None):
+    global account_store
+
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
@@ -553,11 +556,15 @@ if __name__ == '__main__':
         default=str(DEFAULT_ACCOUNT_DATABASE),
         help='SQLite database for console accounts',
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     port = args.port
     account_store = DenariusAccountStore(args.accounts_database)
 
     node_base_url()
     app.run(host=args.host, port=port)
+
+
+if __name__ == '__main__':
+    main()
 
 

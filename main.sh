@@ -1,1 +1,5 @@
-pip3 install -r requirements.txt && python3 run_denarius.py
+#!/usr/bin/env sh
+set -eu
+
+python3 -m pip install .
+exec denarius "$@"

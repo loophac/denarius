@@ -28,6 +28,7 @@ Compared with the original one, we now introduce:
 - Transactional SQLite state persistence instead of Python pickle files.
 - Password-encrypted wallet files using scrypt and AES-256-GCM.
 - Separate node API and unified local Denarius Console processes.
+- Persistent console accounts with administrator and standard-user roles.
 - Deduplicated transaction and block relay across compatible peers.
 - Background, header-first synchronization that downloads blocks only from the
   strongest compatible header chain.
@@ -62,24 +63,38 @@ consensus values and canonical serialization rules live in
 
 ## Requirements
 
-In order to run this code, you'll need:
+Denarius supports Python 3.10, 3.11, and 3.12 on Windows and Linux. Direct
+runtime, development, and build dependencies are pinned to exact versions.
 
-- Python 3
-- cryptography
-- Flask
-- Requests
-- pytest, for running the regression tests
+Install the application from a source checkout:
 
-To install run:
-
+```bash
+python -m venv .venv
 ```
-pip install -r requirements.txt
+
+Activate the environment with `.\.venv\Scripts\Activate.ps1` on PowerShell or
+`source .venv/bin/activate` on Linux, then install Denarius:
+
+```bash
+python -m pip install .
+```
+
+Contributors should install the development tools instead:
+
+```bash
+python -m pip install -e ".[dev]"
 ```
 
 
 ## Usage
 
-Start the node API and unified local console together:
+Start the installed node API and unified local console together:
+
+```bash
+denarius
+```
+
+The source checkout remains directly runnable without installation:
 
 ```bash
 python run_denarius.py
@@ -108,12 +123,16 @@ Node state is stored transactionally in `states/denarius.db`. SQLite keeps
 blocks, pending transactions, peers, and node metadata in separate tables and
 uses full synchronous writes with write-ahead logging.
 
+By default, `states` is created beneath the directory where Denarius is started.
+Set `DENARIUS_STATE_DIR` to use a stable absolute state directory when running
+the installed commands as a service.
+
 The two services can also be run independently:
 
 ```bash
 export DENARIUS_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
-python blockchain/blockchain.py --port 5000 --database states/denarius.db
-python blockchain_client/blockchain_client.py --port 8080 --accounts-database states/console-accounts.db
+denarius-node --port 5000 --database states/denarius.db
+denarius-console --port 8080 --accounts-database states/console-accounts.db
 ```
 
 Use the same `DENARIUS_ADMIN_TOKEN` for the node and console when starting
@@ -126,8 +145,8 @@ Phase 1 uses protocol version 2, account nonces, transaction IDs, Merkle roots,
 and deterministic proof-of-work targets. State files created by Phase 0 or
 older versions use a different consensus format and are intentionally rejected.
 Archive an older state file and start without it to create a fresh Phase 1
-chain. Phases 2 through 4 do not change consensus or require another chain reset. A valid
-Phase 1 JSON state can be migrated into SQLite:
+chain. Phases 2 through 5 do not change consensus or require another chain
+reset. A valid Phase 1 JSON state can be migrated into SQLite:
 
 ```bash
 python blockchain/blockchain.py --migrate-json states/blockchain.json --database states/denarius.db
@@ -135,11 +154,12 @@ python blockchain/blockchain.py --migrate-json states/blockchain.json --database
 
 The wallet creates an Ed25519 key, encrypts it with scrypt and AES-256-GCM, and
 saves the encrypted wallet document in account-scoped browser local storage.
-Raw private keys are never returned to the web page or stored in the browser. To send DEN,
-select a saved sender wallet and enter its password; the local console process
-decrypts it in memory, reads the next account nonce from the selected node, and
-uses the plaintext key only for that signing request. `.denwallet` backup files
-can be exported and imported, but they are not required for routine payments.
+Raw private keys are never returned to the web page or stored in the browser. To
+send DEN, select a saved sender wallet and enter its password; the local console
+process decrypts it in memory, reads the next account nonce from the selected
+node, and uses the plaintext key only for that signing request. `.denwallet`
+backup files can be exported and imported, but they are not required for routine
+payments.
 
 ## Peer networking
 
@@ -168,10 +188,13 @@ trusted local network, complete administrator setup first, then add
 `--console-host 0.0.0.0` and connect to port `8080`. Do not use the Flask
 development server as a public internet service.
 
-To run the tests:
+Install the pinned development dependencies, run every regression and process
+integration test, and build the release artifacts:
 
 ```bash
-pytest
+python -m pip install -r requirements-dev.txt
+python -m pytest
+python -m build
 ```
 
 The regression tests cover monetary policy, canonical transaction IDs, account
@@ -182,7 +205,20 @@ state loading and migration, authenticated wallet encryption, process
 separation, Denarii display formatting, protocol compatibility, relay
 deduplication, peer health, background synchronization, and header-first chain
 resolution, persistent console accounts, role authorization, and account-scoped
-wallet storage.
+wallet storage. The process integration suite starts real node and console
+services to verify administrator setup, wallet creation, mining, persistence
+across restart, standard-user restrictions, and two-node synchronization.
+
+## Release quality
+
+GitHub Actions runs the full suite on Windows and Linux with Python 3.10 and
+3.12, then builds and smoke-tests the wheel and source archive. The stable
+`Release quality` status is the required branch-protection check described in
+[docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and protocol-change
+guidelines, [docs/RELEASING.md](docs/RELEASING.md) for the release checklist,
+and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Security notes
 
@@ -192,3 +228,5 @@ wallet files, SQLite state files, private keys, and TLS key files are ignored
 and must never be committed. A `.denwallet` file still controls funds when paired
 with its password; back up both separately. Historical example keys previously
 included in this repository should be considered public and must not be reused.
+Report suspected vulnerabilities privately by following
+[SECURITY.md](SECURITY.md).
