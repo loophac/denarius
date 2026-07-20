@@ -145,7 +145,8 @@
                 <div class="row">
                   <label class="col-sm-12">Amount to Send:</label>
                   <div class="col-sm-12">
-                    <input type="text" name="amount" id="confirmation_amount" rows="2" class="form-control" readonly>
+                    <input type="text" id="confirmation_amount_display" rows="2" class="form-control" readonly>
+                    <input type="hidden" name="amount" id="confirmation_amount">
                   </div>
                 </div>
 
@@ -236,6 +237,14 @@
 
     <script>
 
+      function formatDenarii(atomicValue) {
+        var atomic = BigInt(atomicValue);
+        var units = 100000000n;
+        var whole = atomic / units;
+        var fractional = (atomic % units).toString().padStart(8, "0").replace(/0+$/, "");
+        return (fractional ? whole.toString() + "." + fractional : whole.toString()) + " DEN";
+      }
+
       $(function () {
           $("#generate_transaction").click(function () {
 
@@ -249,6 +258,7 @@
                 document.getElementById("confirmation_sender_address").value = response["transaction"]["sender_address"];
                 document.getElementById("confirmation_recipient_address").value = response["transaction"]["recipient_address"];
                 document.getElementById("confirmation_amount").value = response["transaction"]["value"];
+                document.getElementById("confirmation_amount_display").value = formatDenarii(response["transaction"]["value"]);
                 document.getElementById("transaction_signature").value = response["signature"];
 
                 $("#basicModal").modal('show');
@@ -271,7 +281,6 @@
             $.ajax({
               url: document.getElementById("node_url").value + "/transactions/new",
               type: "POST",
-              headers: {'Access-Control-Allow-Origin':'*'},
               dataType : 'json',
               data: $('#confirmation_transaction_form').serialize(),
               success: function(response){

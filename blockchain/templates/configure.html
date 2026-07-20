@@ -180,12 +180,15 @@
     <script>
       $(function(){
 
+          var csrfToken = {{ csrf_token|tojson }};
+
           $("#add_node_button").click(function () {
             //console.log($('#confirmation_transaction_form').serialize());
 
             $.ajax({
               url: "/nodes/register",
               type: "POST",
+              headers: {"X-CSRF-Token": csrfToken},
               dataType : 'json',
               data: $('#node_form').serialize(),
               success: function(response){
@@ -208,6 +211,7 @@
             $.ajax({
               url: "/miner/register",
               type: "POST",
+              headers: {"X-CSRF-Token": csrfToken},
               dataType : 'json',
               data: $('#info_form').serialize(),
               success: function(response){
@@ -231,14 +235,15 @@
           success: function(response){
 
             console.log(response['nodes']);
-            var node = "";
-            
-            for (i = 0; i < response['nodes'].length; i++) { 
-              //node = "<li>" + response['nodes'][i] + "</li>";
-              node = "<li> <a href=http://" + response['nodes'][i] + ">" + response['nodes'][i] +"</a></li>";
-              document.getElementById("list_nodes").innerHTML += node;
-
-            };
+            var nodeList = document.getElementById("list_nodes");
+            for (i = 0; i < response['nodes'].length; i++) {
+              var listItem = document.createElement("li");
+              var nodeLink = document.createElement("a");
+              nodeLink.href = "http://" + response['nodes'][i];
+              nodeLink.textContent = response['nodes'][i];
+              listItem.appendChild(nodeLink);
+              nodeList.appendChild(listItem);
+            }
           
           },
           error: function(error){
@@ -253,9 +258,9 @@
 
             console.log(response['miner']);
 
-            document.getElementById("m_name").innerHTML = response['name']
-            document.getElementById("m_address").innerHTML = response['address']
-            document.getElementById("m_balance").innerHTML = response['balance']
+            document.getElementById("m_name").textContent = response['name'];
+            document.getElementById("m_address").textContent = response['address'];
+            document.getElementById("m_balance").textContent = response['balance'] + " DEN";
 
 
           },

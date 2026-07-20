@@ -1,5 +1,6 @@
 from collections import OrderedDict
 import binascii
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -33,14 +34,19 @@ def install_flask_stubs():
 
     flask_stub.Flask = Flask
     flask_stub.jsonify = lambda *args, **kwargs: args[0] if args else kwargs
-    flask_stub.request = types.SimpleNamespace(form={}, get_json=lambda silent=True: {})
+    flask_stub.request = types.SimpleNamespace(
+        form={},
+        headers={},
+        method="GET",
+        get_json=lambda silent=True: {},
+    )
     flask_stub.render_template = lambda *args, **kwargs: ""
     flask_stub.redirect = lambda value: value
     flask_stub.session = {}
     flask_stub.url_for = lambda endpoint: endpoint
 
     flask_cors_stub = types.ModuleType("flask_cors")
-    flask_cors_stub.CORS = lambda app: app
+    flask_cors_stub.CORS = lambda app, **kwargs: app
 
     sys.modules.setdefault("flask", flask_stub)
     sys.modules.setdefault("flask_cors", flask_cors_stub)
@@ -74,10 +80,16 @@ Transaction = denarius_client.Transaction
 
 
 def mine_block(blockchain):
-    nonce = blockchain.proof_of_work()
-    previous_hash = blockchain.hash(blockchain.chain[-1])
-    blockchain.transactions.append(blockchain.create_coinbase_transaction())
-    return blockchain.create_block(nonce, previous_hash)
+    block = blockchain.mine_pending_transactions(relay=False, persist=False)
+    assert block is not False
+    return block
+
+
+def mine_candidate(blockchain, mutate=None):
+    candidate = blockchain.create_candidate_block()
+    if mutate:
+        mutate(candidate)
+    return blockchain.proof_of_work(candidate)
 
 
 def mine_empty_block(blockchain):
@@ -183,10 +195,17 @@ def test_ed25519_signature_and_address_checksum_are_required():
     blockchain, sender_address, private_key = funded_blockchain()
     recipient_address, _ = wallet(blockchain)
     transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
+    invalid_sender = sender_address[:-1] + ("0" if sender_address[-1] != "0" else "1")
+    invalid_recipient = recipient_address[:-1] + ("0" if recipient_address[-1] != "0" else "1")
 
     assert blockchain.verify_transaction_signature(sender_address, signature, transaction) is True
-    assert blockchain.verify_transaction_signature(sender_address[:-1] + "0", signature, transaction) is False
-    assert blockchain.submit_transaction(sender_address, recipient_address[:-1] + "0", transaction["value"], signature) is False
+    assert blockchain.verify_transaction_signature(invalid_sender, signature, transaction) is False
+    assert blockchain.submit_transaction(
+        sender_address,
+        invalid_recipient,
+        transaction["value"],
+        signature,
+    ) is False
 
 
 def test_forged_signature_is_rejected():
@@ -213,14 +232,14 @@ def test_valid_chain_requires_canonical_genesis_block():
 def test_valid_chain_rejects_incorrect_coinbase_reward():
     blockchain = Blockchain()
     miner_address, _ = wallet(blockchain)
-    nonce = blockchain.proof_of_work()
-    previous_hash = blockchain.hash(blockchain.chain[-1])
-    blockchain.transactions.append(OrderedDict({
-        "sender_address": blockchain.COINBASE_SENDER,
-        "recipient_address": miner_address,
-        "value": str(blockchain.block_reward(1) + 1),
-    }))
-    blockchain.create_block(nonce, previous_hash)
+    blockchain.node_address = miner_address
+    block = mine_candidate(
+        blockchain,
+        lambda candidate: candidate["transactions"][-1].update(
+            value=str(blockchain.block_reward(1) + 1)
+        ),
+    )
+    blockchain.chain.append(block)
 
     assert blockchain.valid_chain(blockchain.chain) is False
 
@@ -229,11 +248,13 @@ def test_valid_chain_rejects_multiple_coinbase_transactions():
     blockchain = Blockchain()
     miner_address, _ = wallet(blockchain)
     blockchain.node_address = miner_address
-    blockchain.transactions.append(blockchain.create_coinbase_transaction())
-    nonce = blockchain.proof_of_work()
-    previous_hash = blockchain.hash(blockchain.chain[-1])
-    blockchain.transactions.append(blockchain.create_coinbase_transaction())
-    blockchain.create_block(nonce, previous_hash)
+    block = mine_candidate(
+        blockchain,
+        lambda candidate: candidate["transactions"].insert(
+            0, blockchain.create_coinbase_transaction()
+        ),
+    )
+    blockchain.chain.append(block)
 
     assert blockchain.valid_chain(blockchain.chain) is False
 
@@ -250,10 +271,7 @@ def test_valid_chain_rejects_invalid_difficulty():
 
 def test_coinbase_requires_valid_denarius_address():
     blockchain = Blockchain()
-    nonce = blockchain.proof_of_work()
-    previous_hash = blockchain.hash(blockchain.chain[-1])
-    blockchain.transactions.append(blockchain.create_coinbase_transaction())
-    blockchain.create_block(nonce, previous_hash)
+    blockchain.chain.append(mine_candidate(blockchain))
 
     assert blockchain.valid_chain(blockchain.chain) is False
 
@@ -282,15 +300,12 @@ def test_valid_chain_replays_transaction_balances():
 
     transaction["signature"] = signature
     blockchain.transactions.append(transaction)
-    nonce = blockchain.proof_of_work()
-    previous_hash = blockchain.hash(blockchain.chain[-1])
-    blockchain.transactions.append(blockchain.create_coinbase_transaction())
-    blockchain.create_block(nonce, previous_hash)
+    blockchain.chain.append(mine_candidate(blockchain))
 
     assert blockchain.valid_chain(blockchain.chain) is False
 
 
-def test_valid_chain_rejects_duplicate_signed_transactions_across_blocks():
+def test_submit_rejects_confirmed_transaction_replay():
     blockchain, sender_address, private_key = funded_blockchain()
     recipient_address, _ = wallet(blockchain)
     transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
@@ -298,11 +313,51 @@ def test_valid_chain_rejects_duplicate_signed_transactions_across_blocks():
     assert blockchain.submit_transaction(sender_address, recipient_address, transaction["value"], signature, relay=False)
     mine_block(blockchain)
 
-    blockchain.transactions.append(OrderedDict(transaction))
-    blockchain.transactions[-1]["signature"] = signature
-    mine_block(blockchain)
+    assert blockchain.submit_transaction(
+        sender_address,
+        recipient_address,
+        transaction["value"],
+        signature,
+        relay=False,
+    ) is False
 
-    assert blockchain.valid_chain(blockchain.chain) is False
+
+def test_miner_will_not_append_a_replayed_transaction():
+    blockchain, sender_address, private_key = funded_blockchain()
+    recipient_address, _ = wallet(blockchain)
+    transaction, signature = signed_transaction(sender_address, private_key, recipient_address, "1")
+    transaction["signature"] = signature
+
+    blockchain.transactions.append(copy.deepcopy(transaction))
+    mine_block(blockchain)
+    chain_length = len(blockchain.chain)
+    blockchain.transactions.append(copy.deepcopy(transaction))
+
+    assert blockchain.mine_pending_transactions(relay=False, persist=False) is False
+    assert len(blockchain.chain) == chain_length
+
+
+def test_coinbase_recipient_is_bound_to_proof_of_work():
+    blockchain = Blockchain()
+    miner_address, _ = wallet(blockchain)
+    thief_address, _ = wallet(blockchain)
+    blockchain.node_address = miner_address
+    block = mine_block(blockchain)
+    altered_block = copy.deepcopy(block)
+    altered_block["transactions"][-1]["recipient_address"] = thief_address
+
+    assert blockchain.valid_proof(altered_block) is False
+    assert blockchain.valid_chain([blockchain.chain[0], altered_block]) is False
+
+
+def test_block_metadata_is_bound_to_proof_of_work():
+    blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
+    block = mine_block(blockchain)
+    altered_block = copy.deepcopy(block)
+    altered_block["timestamp"] += 1
+
+    assert blockchain.valid_proof(altered_block) is False
 
 
 def test_state_is_saved_and_loaded_as_json():
@@ -321,6 +376,97 @@ def test_state_is_saved_and_loaded_as_json():
     assert restored.node_address == miner_address
     assert restored.miner_name == "miner"
     assert restored.nodes == {"127.0.0.1:5001"}
+
+
+def test_state_loader_rejects_a_tampered_chain():
+    blockchain, _, _ = funded_blockchain()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_path = Path(tmpdir) / "blockchain.json"
+        blockchain.STATE_PATH = state_path
+        blockchain.save_everything()
+        state = json.loads(state_path.read_text())
+        state["chain"][-1]["timestamp"] += 1
+        state_path.write_text(json.dumps(state))
+
+        try:
+            Blockchain().load_everything(state_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("tampered state chain was loaded")
+
+
+def test_mining_reserves_space_for_coinbase_and_leaves_overflow_pending():
+    blockchain, sender_address, private_key = funded_blockchain()
+    blockchain.MAX_TRANSACTIONS_PER_BLOCK = 2
+    first_recipient, _ = wallet(blockchain)
+    second_recipient, _ = wallet(blockchain)
+    first, first_signature = signed_transaction(sender_address, private_key, first_recipient, "1")
+    second, second_signature = signed_transaction(sender_address, private_key, second_recipient, "1")
+
+    assert blockchain.submit_transaction(
+        sender_address, first_recipient, first["value"], first_signature, relay=False
+    )
+    assert blockchain.submit_transaction(
+        sender_address, second_recipient, second["value"], second_signature, relay=False
+    )
+
+    block = mine_block(blockchain)
+
+    assert len(block["transactions"]) == 2
+    assert len(blockchain.transactions) == 1
+    assert blockchain.valid_chain(blockchain.chain) is True
+
+
+def test_local_admin_passwords_are_salted_and_verified():
+    password = "correct horse battery staple"
+    first_hash = denarius_blockchain.hash_password(password)
+    second_hash = denarius_blockchain.hash_password(password)
+
+    assert first_hash != second_hash
+    assert denarius_blockchain.verify_password(password, first_hash) is True
+    assert denarius_blockchain.verify_password("wrong password", first_hash) is False
+
+
+def test_admin_mining_requires_login_and_csrf():
+    original_user = denarius_blockchain.registered_user
+    original_session = dict(denarius_blockchain.session)
+    original_headers = denarius_blockchain.request.headers
+    try:
+        denarius_blockchain.registered_user = {
+            "username": "admin",
+            "password_hash": denarius_blockchain.hash_password("a secure password"),
+        }
+        denarius_blockchain.session.clear()
+        assert denarius_blockchain.mine() == "login"
+
+        denarius_blockchain.session.update({"user": "admin", "csrf_token": "expected"})
+        denarius_blockchain.request.headers = {}
+        _, status = denarius_blockchain.mine()
+        assert status == 403
+
+        denarius_blockchain.request.headers = {"X-CSRF-Token": "expected"}
+        with patch.object(denarius_blockchain.blockchain, "mine_pending_transactions", return_value=False):
+            _, status = denarius_blockchain.mine()
+        assert status == 406
+    finally:
+        denarius_blockchain.registered_user = original_user
+        denarius_blockchain.session.clear()
+        denarius_blockchain.session.update(original_session)
+        denarius_blockchain.request.headers = original_headers
+
+
+def test_node_urls_reject_paths_and_markup():
+    blockchain = Blockchain()
+
+    for node in ("http://127.0.0.1:5001/path", '127.0.0.1:5001"><script>'):
+        try:
+            blockchain.register_node(node)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe node URL was accepted")
 
 
 def test_submit_transaction_relays_to_known_peers():
@@ -381,6 +527,7 @@ def test_accept_block_rejects_invalid_peer_block():
 
 def test_valid_chain_rejects_oversized_blocks():
     blockchain = Blockchain()
+    blockchain.node_address, _ = wallet(blockchain)
     mine_block(blockchain)
     blockchain.MAX_TRANSACTIONS_PER_BLOCK = 0
 
@@ -446,8 +593,12 @@ def test_resolve_conflicts_prefers_greater_chainwork_over_length():
 def test_transaction_tables_format_atomic_values_as_denarii():
     miner_template = (ROOT / "blockchain" / "templates" / "index.html").read_text()
     client_template = (ROOT / "blockchain_client" / "templates" / "view_transactions.html").read_text()
+    send_template = (ROOT / "blockchain_client" / "templates" / "make_transaction.html").read_text()
 
     for template in (miner_template, client_template):
         assert "function formatDenarii" in template
         assert 'response["chain"].length' in template
         assert 'formatDenarii(response["chain"][i]["transactions"][j]["value"])' in template
+
+    assert "confirmation_amount_display" in send_template
+    assert 'formatDenarii(response["transaction"]["value"])' in send_template

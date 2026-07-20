@@ -13,11 +13,11 @@ Compared with the original one, we now introduce:
 - Balance check before every transaction.
 - Transaction failure alert.
 - Dynamic `difficulty` update every 2 weeks.
-- SSL support.
 - Save running states.
 
 
-(Risky, not recommended) If you need SSL support, add certificate(inside `certificates` folder) to your system(`cert.pem`) or your browser(`cert.p12`). 
+The historical bundled certificate and private-key examples have been removed.
+Do not commit wallet or transport private keys.
 
 
 ## Requirements

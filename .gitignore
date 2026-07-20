@@ -4,3 +4,8 @@
 __pycache__/
 *.py[cod]
 states/*.json
+states/*.json.tmp
+certificates/
+*.key
+*.pem
+*.p12

@@ -1,8 +1,14 @@
 import binascii
+import copy
 import hashlib
+import hmac
 import json
+import os
+import secrets
+import threading
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from pathlib import Path
 from time import time
 from urllib.parse import urlparse
@@ -24,6 +30,7 @@ class Blockchain:
     MAX_PEERS = 128
     MAX_PENDING_TRANSACTIONS = 1000
     MAX_TRANSACTIONS_PER_BLOCK = 1000
+    MAX_DIFFICULTY = 16
     GENESIS_BLOCK = {
         'block_number': 0,
         'timestamp': 1546300800,
@@ -36,6 +43,7 @@ class Blockchain:
 
     def __init__(self, name="THE BLOCKCHAIN"):
 
+        self._lock = threading.RLock()
         self.transactions = []
         self.chain = []
         self.nodes = set()
@@ -99,8 +107,11 @@ class Blockchain:
         """
         if self.public_key_from_address(address) is None:
             raise ValueError('Invalid miner address')
-        self.miner_name = name
-        self.node_address = address
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+            raise ValueError('Invalid miner name')
+        with self._lock:
+            self.miner_name = name.strip()
+            self.node_address = address
 
     def update_hyperparameters(self):
         """
@@ -118,18 +129,41 @@ class Blockchain:
             if time_diff > 0:
                 adjustment = two_week / time_diff
                 adjustment = max(0.25, min(4.0, adjustment))
-                self.MINING_DIFFICULTY = max(1, int(round(self.MINING_DIFFICULTY * adjustment)))
+                self.MINING_DIFFICULTY = min(
+                    self.MAX_DIFFICULTY,
+                    max(1, int(round(self.MINING_DIFFICULTY * adjustment))),
+                )
 
         if last_index % (6 * 30 * 24 * 6) == 0 and last_index != 0:
             self.MINING_REWARD = self.block_reward(last_index + 1)
 
     def normalize_node(self, node_url):
-        parsed_url = urlparse(node_url)
-        if parsed_url.netloc:
-            return parsed_url.netloc
-        if parsed_url.path:
-            return parsed_url.path
-        raise ValueError('Invalid URL')
+        if not isinstance(node_url, str):
+            raise ValueError('Invalid URL')
+
+        node_url = node_url.strip()
+        if not node_url or len(node_url) > 255:
+            raise ValueError('Invalid URL')
+
+        candidate = node_url if '://' in node_url else 'http://' + node_url
+        parsed_url = urlparse(candidate)
+        if parsed_url.scheme != 'http' or parsed_url.username or parsed_url.password:
+            raise ValueError('Invalid URL')
+        if parsed_url.path not in ('', '/') or parsed_url.query or parsed_url.fragment:
+            raise ValueError('Invalid URL')
+
+        try:
+            port = parsed_url.port
+        except ValueError as exc:
+            raise ValueError('Invalid URL') from exc
+
+        hostname = parsed_url.hostname
+        if not hostname or any(character.isspace() for character in hostname):
+            raise ValueError('Invalid URL')
+
+        if ':' in hostname:
+            hostname = '[' + hostname + ']'
+        return hostname + (':' + str(port) if port is not None else '')
 
     def peer_url(self, node, path):
         return 'http://' + node + path
@@ -138,9 +172,11 @@ class Blockchain:
         """
         Add a new node to the list of nodes
         """
-        if len(self.nodes) >= self.MAX_PEERS:
-            raise ValueError('Peer limit reached')
-        self.nodes.add(self.normalize_node(node_url))
+        normalized_node = self.normalize_node(node_url)
+        with self._lock:
+            if len(self.nodes) >= self.MAX_PEERS and normalized_node not in self.nodes:
+                raise ValueError('Peer limit reached')
+            self.nodes.add(normalized_node)
 
     def exchange_peer_table(self):
         for node in list(self.nodes):
@@ -231,11 +267,13 @@ class Blockchain:
         :return: balance (Float)
         """
         balance = 0
-        for i, c in reversed(list(enumerate(self.chain))):
-            for j, t in enumerate(c['transactions']):
+        with self._lock:
+            chain = copy.deepcopy(self.chain)
+        for c in chain:
+            for t in c['transactions']:
                 if t['sender_address'] == address and t['recipient_address'] == address:
-                    pass
-                elif t['recipient_address'] == address:
+                    continue
+                if t['recipient_address'] == address:
                     balance += self.parse_atomic_value(t['value']) or 0
                 elif t['sender_address'] == address:
                     balance -= self.parse_atomic_value(t['value']) or 0
@@ -243,7 +281,11 @@ class Blockchain:
 
     def get_atomic_balance(self, address, include_pending=False):
         balance = 0
-        for c in self.chain:
+        with self._lock:
+            chain = copy.deepcopy(self.chain)
+            pending_transactions = copy.deepcopy(self.transactions) if include_pending else []
+
+        for c in chain:
             for t in c['transactions']:
                 atomic_value = self.parse_atomic_value(t['value']) or 0
                 if t['sender_address'] == address and t['recipient_address'] == address:
@@ -254,11 +296,22 @@ class Blockchain:
                     balance -= atomic_value
 
         if include_pending:
-            for t in self.transactions:
+            for t in pending_transactions:
                 atomic_value = self.parse_atomic_value(t['value']) or 0
                 if t['sender_address'] == address:
                     balance -= atomic_value
         return balance
+
+    def transaction_key(self, transaction):
+        return hashlib.sha256(self.canonical_transaction_bytes(transaction)).hexdigest()
+
+    def confirmed_transaction_keys(self, chain=None):
+        transaction_keys = set()
+        for block in chain if chain is not None else self.chain:
+            for transaction in block.get('transactions', []):
+                if transaction.get('sender_address') != self.COINBASE_SENDER:
+                    transaction_keys.add(self.transaction_key(transaction))
+        return transaction_keys
 
     def verify_enough_balance(self, address, atomic_value):
         """
@@ -273,9 +326,6 @@ class Blockchain:
         """
         Add a transaction to transactions array if the signature verified
         """
-        if len(self.transactions) >= self.MAX_PENDING_TRANSACTIONS:
-            return False
-
         atomic_value = self.parse_atomic_value(value)
         if atomic_value is None:
             return False
@@ -290,85 +340,141 @@ class Blockchain:
             return False
 
         transaction_verification = self.verify_transaction_signature(sender_address, signature, transaction)
-        enough_balance = self.verify_enough_balance(sender_address, atomic_value)
-        if transaction_verification and enough_balance:
-            signed_transaction = OrderedDict(transaction)
-            signed_transaction['signature'] = signature
-            if signed_transaction in self.transactions:
-                return False
-            self.transactions.append(signed_transaction)
-            if relay:
-                self.broadcast_transaction(signed_transaction)
-            return len(self.chain)
-        return False
-
-    def create_coinbase_transaction(self):
-        return OrderedDict({'sender_address': self.COINBASE_SENDER,
-                            'recipient_address': self.node_address,
-                            'value': str(self.block_reward(len(self.chain)))})
-
-    def create_block(self, nonce, previous_hash):
-        """
-        Add a block of transactions to the blockchain
-        """
-        if len(self.transactions) > self.MAX_TRANSACTIONS_PER_BLOCK:
+        if not transaction_verification:
             return False
 
-        block = {'block_number': len(self.chain),
-                 'timestamp': time(),
-                 'transactions': self.transactions,
-                 'nonce': nonce,
-                 'previous_hash': previous_hash,
-                 'difficulty': int(self.MINING_DIFFICULTY)}
+        signed_transaction = OrderedDict(transaction)
+        signed_transaction['signature'] = signature
 
-        # Reset the current list of transactions
-        self.transactions = []
+        with self._lock:
+            if len(self.transactions) >= self.MAX_PENDING_TRANSACTIONS:
+                return False
+            if not self.verify_enough_balance(sender_address, atomic_value):
+                return False
 
-        self.chain.append(block)
+            transaction_key = self.transaction_key(signed_transaction)
+            if transaction_key in self.confirmed_transaction_keys():
+                return False
+            if any(self.transaction_key(pending) == transaction_key for pending in self.transactions):
+                return False
 
-        # Update hyperparameters.
-        self.update_hyperparameters()
+            self.transactions.append(signed_transaction)
+            next_block_number = len(self.chain)
 
+        if relay:
+            self.broadcast_transaction(signed_transaction)
+        return next_block_number
+
+    def create_coinbase_transaction(self, height=None, recipient_address=None):
+        height = len(self.chain) if height is None else height
+        recipient_address = self.node_address if recipient_address is None else recipient_address
+        return OrderedDict({'sender_address': self.COINBASE_SENDER,
+                            'recipient_address': recipient_address,
+                            'value': str(self.block_reward(height))})
+
+    def create_candidate_block(self):
+        with self._lock:
+            height = len(self.chain)
+            previous_hash = self.hash(self.chain[-1])
+            pending_limit = max(0, self.MAX_TRANSACTIONS_PER_BLOCK - 1)
+            pending_snapshot = copy.deepcopy(self.transactions[:pending_limit])
+            recipient_address = self.node_address
+            difficulty = int(self.MINING_DIFFICULTY)
+
+        coinbase = self.create_coinbase_transaction(height, recipient_address)
+        block = {
+            'block_number': height,
+            'timestamp': int(time()),
+            'transactions': pending_snapshot + [coinbase],
+            'nonce': 0,
+            'previous_hash': previous_hash,
+            'difficulty': difficulty,
+        }
         return block
 
     def hash(self, block):
         """
         Create a SHA-256 hash of a block
         """
-        # We must make sure that the Dictionary is Ordered, or we'll have inconsistent hashes
-        block_string = json.dumps(block, sort_keys=True).encode()
+        block_string = json.dumps(
+            block,
+            sort_keys=True,
+            separators=(',', ':'),
+            allow_nan=False,
+        ).encode('utf8')
 
         return hashlib.sha256(block_string).hexdigest()
 
-    def proof_of_work(self):
+    def proof_of_work(self, candidate_block):
         """
-        Proof of work algorithm
+        Find a nonce for a complete candidate block. Every consensus field,
+        including the coinbase reward, is committed by the proof.
         """
-        last_block = self.chain[-1]
-        last_hash = self.hash(last_block)
+        if not isinstance(candidate_block, dict):
+            raise ValueError('Invalid candidate block')
+        difficulty = candidate_block.get('difficulty')
+        if (not isinstance(difficulty, int) or isinstance(difficulty, bool)
+                or difficulty < 1 or difficulty > self.MAX_DIFFICULTY):
+            raise ValueError('Invalid candidate block difficulty')
 
+        block = copy.deepcopy(candidate_block)
         nonce = 0
-        transactions = self.proof_transactions(self.transactions)
-        while self.valid_proof(transactions, last_hash, nonce, self.MINING_DIFFICULTY) is False:
+        block['nonce'] = nonce
+        while not self.valid_proof(block):
             nonce += 1
+            block['nonce'] = nonce
+        return block
 
-        return nonce
-
-    def proof_transactions(self, transactions):
-        transaction_elements = ['sender_address', 'recipient_address', 'value', 'signature']
-        return [OrderedDict((k, transaction[k]) for k in transaction_elements if k in transaction)
-                for transaction in transactions]
-
-    def valid_proof(self, transactions, last_hash, nonce, difficulty=None):
+    def valid_proof(self, block):
         """
-        Check if a hash value satisfies the mining conditions. This function is used within the proof_of_work function.
+        Check whether a complete block hash satisfies its declared difficulty.
         """
-        guess = (str(transactions) + str(last_hash) + str(nonce)).encode()
-        guess_hash = hashlib.sha256(guess).hexdigest()
-        difficulty = int(difficulty if difficulty is not None else self.MINING_DIFFICULTY)
-        return guess_hash[:difficulty] == '0' * difficulty
+        if not isinstance(block, dict):
+            return False
+        difficulty = block.get('difficulty')
+        if not isinstance(difficulty, int) or isinstance(difficulty, bool):
+            return False
+        if difficulty < 1 or difficulty > self.MAX_DIFFICULTY:
+            return False
+        try:
+            block_hash = self.hash(block)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return block_hash.startswith('0' * difficulty)
+
+    def mine_pending_transactions(self, relay=True, persist=True):
+        if self.public_key_from_address(self.node_address) is None:
+            return False
+
+        candidate = self.create_candidate_block()
+        block = self.proof_of_work(candidate)
+
+        with self._lock:
+            if block['block_number'] != len(self.chain):
+                return False
+            if block['previous_hash'] != self.hash(self.chain[-1]):
+                return False
+
+            candidate_chain = self.chain + [block]
+            if not self.valid_chain(candidate_chain):
+                return False
+
+            self.chain.append(block)
+            self.remove_confirmed_transactions(block)
+            self.update_hyperparameters()
+            if persist:
+                self.save_everything()
+
+        if relay:
+            self.broadcast_block(block)
+        return block
 
     def apply_transaction(self, transaction, ledger, require_signature=True):
+        if not isinstance(transaction, dict):
+            return False
+        if set(transaction) != {'sender_address', 'recipient_address', 'value', 'signature'}:
+            return False
+
         atomic_value = self.parse_atomic_value(transaction.get('value'))
         if atomic_value is None:
             return False
@@ -396,6 +502,11 @@ class Blockchain:
         return True
 
     def apply_coinbase_transaction(self, transaction, ledger, height):
+        if not isinstance(transaction, dict):
+            return False
+        if set(transaction) != {'sender_address', 'recipient_address', 'value'}:
+            return False
+
         atomic_value = self.parse_atomic_value(transaction.get('value'))
         if atomic_value is None:
             return False
@@ -418,48 +529,48 @@ class Blockchain:
         """
         check if a blockchain is valid
         """
-        if not chain or chain[0] != self.GENESIS_BLOCK:
+        if not isinstance(chain, list) or not chain or chain[0] != self.GENESIS_BLOCK:
             return False
 
         ledger = {}
         seen_transactions = set()
         last_block = chain[0]
         current_index = 1
+        required_block_fields = {
+            'block_number',
+            'timestamp',
+            'transactions',
+            'nonce',
+            'previous_hash',
+            'difficulty',
+        }
 
         while current_index < len(chain):
             block = chain[current_index]
-            # print(last_block)
-            # print(block)
-            # print("\n-----------\n")
-            # Check that the hash of the block is correct
+            if not isinstance(block, dict) or set(block) != required_block_fields:
+                return False
+            if block['block_number'] != current_index:
+                return False
+            if not isinstance(block['nonce'], int) or isinstance(block['nonce'], bool) or block['nonce'] < 0:
+                return False
+            if not isinstance(block['timestamp'], int) or isinstance(block['timestamp'], bool):
+                return False
             if block['previous_hash'] != self.hash(last_block):
                 return False
-
-            if block.get('block_number') != current_index:
+            if not isinstance(block['transactions'], list) or not block['transactions']:
+                return False
+            if len(block['transactions']) > self.MAX_TRANSACTIONS_PER_BLOCK:
+                return False
+            if not self.valid_proof(block):
                 return False
 
-            difficulty = block.get('difficulty')
-            if not isinstance(difficulty, int) or difficulty < 1:
-                return False
-
-            if not block.get('transactions'):
-                return False
-
-            if len(block.get('transactions', [])) > self.MAX_TRANSACTIONS_PER_BLOCK:
-                return False
-
-            # Check that the Proof of Work is correct
-            # Delete the reward transaction
             transactions = block['transactions'][:-1]
             coinbase_transaction = block['transactions'][-1]
-            # Need to make sure that the dictionary is ordered. Otherwise we'll get a different hash
-            transactions = self.proof_transactions(transactions)
-
-            if not self.valid_proof(transactions, block['previous_hash'], block['nonce'], difficulty):
-                return False
 
             for transaction in transactions:
-                transaction_key = json.dumps(transaction, sort_keys=True, separators=(',', ':'))
+                if not isinstance(transaction, dict):
+                    return False
+                transaction_key = self.transaction_key(transaction)
                 if transaction_key in seen_transactions:
                     return False
                 seen_transactions.add(transaction_key)
@@ -485,21 +596,23 @@ class Blockchain:
                              if transaction not in confirmed_transactions]
 
     def accept_block(self, block, relay=True):
-        if block.get('block_number') != len(self.chain):
+        if not isinstance(block, dict):
             return False
-        if block.get('previous_hash') != self.hash(self.chain[-1]):
-            return False
-        if len(block.get('transactions', [])) > self.MAX_TRANSACTIONS_PER_BLOCK:
-            return False
+        with self._lock:
+            if block.get('block_number') != len(self.chain):
+                return False
+            if block.get('previous_hash') != self.hash(self.chain[-1]):
+                return False
 
-        candidate_chain = self.chain + [block]
-        if not self.valid_chain(candidate_chain):
-            return False
+            candidate_chain = self.chain + [block]
+            if not self.valid_chain(candidate_chain):
+                return False
 
-        self.chain.append(block)
-        self.remove_confirmed_transactions(block)
-        self.update_hyperparameters()
-        self.save_everything()
+            self.chain.append(copy.deepcopy(block))
+            self.remove_confirmed_transactions(block)
+            self.update_hyperparameters()
+            self.save_everything()
+
         if relay:
             self.broadcast_block(block)
         return True
@@ -509,11 +622,13 @@ class Blockchain:
         Resolve conflicts between blockchain's nodes
         by replacing our chain with the longest one in the network.
         """
-        neighbours = self.nodes
+        with self._lock:
+            neighbours = list(self.nodes)
+            current_chain = copy.deepcopy(self.chain)
         new_chain = None
 
         # Prefer the valid chain with the greatest accumulated work.
-        max_work = self.chainwork(self.chain)
+        max_work = self.chainwork(current_chain)
 
         # Grab and verify the chains from all the nodes in our network
         for node in neighbours:
@@ -530,7 +645,10 @@ class Blockchain:
                     chain = response.json()['chain']
                 except (ValueError, KeyError, TypeError):
                     continue
-                chain_work = self.chainwork(chain)
+                try:
+                    chain_work = self.chainwork(chain)
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
 
                 # Check if the peer chain contains more accumulated proof-of-work.
                 if chain_work > max_work:
@@ -539,41 +657,108 @@ class Blockchain:
 
         # Replace our chain if we discovered a new, valid chain longer than ours
         if new_chain:
-            self.chain = new_chain
+            with self._lock:
+                if self.chainwork(new_chain) <= self.chainwork(self.chain):
+                    return False
+                pending_transactions = copy.deepcopy(self.transactions)
+                self.chain = copy.deepcopy(new_chain)
+                self.transactions = []
+                for transaction in pending_transactions:
+                    self.submit_transaction(
+                        transaction.get('sender_address'),
+                        transaction.get('recipient_address'),
+                        transaction.get('value'),
+                        transaction.get('signature'),
+                        relay=False,
+                    )
+                self.MINING_DIFFICULTY = int(self.chain[-1].get('difficulty', self.MINING_DIFFICULTY))
+                self.MINING_REWARD = self.block_reward(len(self.chain))
+                self.save_everything()
             return True
 
         return False
 
 
     def save_everything(self):
-        state = {
-            'chain': self.chain,
-            'transactions': self.transactions,
-            'nodes': sorted(self.nodes),
-            'node_address': self.node_address,
-            'miner_name': self.miner_name,
-            'MINING_DIFFICULTY': self.MINING_DIFFICULTY,
-            'MINING_REWARD': self.MINING_REWARD,
-        }
+        with self._lock:
+            state = {
+                'chain': copy.deepcopy(self.chain),
+                'transactions': copy.deepcopy(self.transactions),
+                'nodes': sorted(self.nodes),
+                'node_address': self.node_address,
+                'miner_name': self.miner_name,
+                'MINING_DIFFICULTY': self.MINING_DIFFICULTY,
+                'MINING_REWARD': self.MINING_REWARD,
+            }
+
         self.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with self.STATE_PATH.open('w', encoding='utf8') as f:
-            json.dump(state, f, sort_keys=True)
+        temporary_path = self.STATE_PATH.with_suffix(self.STATE_PATH.suffix + '.tmp')
+        with temporary_path.open('w', encoding='utf8') as state_file:
+            json.dump(state, state_file, sort_keys=True, allow_nan=False)
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temporary_path, self.STATE_PATH)
 
 
     def load_everything(self, path):
+        state_path = Path(path).resolve()
         try:
-            with open(path, 'r', encoding='utf8') as f:
+            with state_path.open('r', encoding='utf8') as f:
                 state = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return self
+        except FileNotFoundError as exc:
+            raise ValueError('State file does not exist') from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError('State file is not valid JSON') from exc
+        if not isinstance(state, dict):
+            raise ValueError('State file must contain a JSON object')
 
-        self.chain = state.get('chain', self.chain)
-        self.transactions = state.get('transactions', [])
-        self.nodes = set(state.get('nodes', []))
-        self.node_address = state.get('node_address', self.node_address)
-        self.miner_name = state.get('miner_name', self.miner_name)
-        self.MINING_DIFFICULTY = state.get('MINING_DIFFICULTY', self.MINING_DIFFICULTY)
-        self.MINING_REWARD = state.get('MINING_REWARD', self.MINING_REWARD)
+        chain = state.get('chain')
+        if not self.valid_chain(chain):
+            raise ValueError('State file contains an invalid Denarius chain')
+
+        difficulty = state.get('MINING_DIFFICULTY', chain[-1].get('difficulty', 2))
+        if not isinstance(difficulty, int) or isinstance(difficulty, bool):
+            raise ValueError('State file contains an invalid mining difficulty')
+        if difficulty < 1 or difficulty > self.MAX_DIFFICULTY:
+            raise ValueError('State file contains an invalid mining difficulty')
+
+        nodes = set()
+        for node in state.get('nodes', []):
+            if len(nodes) >= self.MAX_PEERS:
+                break
+            nodes.add(self.normalize_node(node))
+
+        node_address = state.get('node_address', self.node_address)
+        if self.public_key_from_address(node_address) is None:
+            node_address = self.node_address
+
+        miner_name = state.get('miner_name', self.miner_name)
+        if not isinstance(miner_name, str) or not miner_name.strip() or len(miner_name.strip()) > 80:
+            raise ValueError('State file contains an invalid miner name')
+
+        pending_validator = Blockchain(miner_name.strip())
+        pending_validator.chain = copy.deepcopy(chain)
+        pending_validator.node_address = node_address
+        for transaction in state.get('transactions', []):
+            if not isinstance(transaction, dict):
+                continue
+            pending_validator.submit_transaction(
+                transaction.get('sender_address'),
+                transaction.get('recipient_address'),
+                transaction.get('value'),
+                transaction.get('signature'),
+                relay=False,
+            )
+
+        with self._lock:
+            self.STATE_PATH = state_path
+            self.chain = copy.deepcopy(chain)
+            self.transactions = copy.deepcopy(pending_validator.transactions)
+            self.nodes = nodes
+            self.node_address = node_address
+            self.miner_name = miner_name.strip()
+            self.MINING_DIFFICULTY = difficulty
+            self.MINING_REWARD = self.block_reward(len(self.chain))
         return self
 
 
@@ -581,35 +766,77 @@ class Blockchain:
 app = Flask(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
-app.secret_key = 'your_secret_key'  # Replace with a strong key
-CORS(app)
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.secret_key = os.environ.get('DENARIUS_SECRET_KEY') or secrets.token_hex(32)
+CORS(app, resources={
+    r'/chain': {'origins': '*'},
+    r'/miner/get': {'origins': '*'},
+    r'/nodes/get': {'origins': '*'},
+    r'/transactions/get': {'origins': '*'},
+    r'/transactions/new': {'origins': '*'},
+})
 
 blockchain = Blockchain()
-registered_user = None  # To keep track of the first registered user
+registered_user = None
+PASSWORD_ITERATIONS = 240000
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf8'), salt, PASSWORD_ITERATIONS)
+    return salt.hex() + ':' + digest.hex()
+
+
+def verify_password(password, encoded_password):
+    try:
+        salt_hex, expected_hex = encoded_password.split(':', 1)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(expected_hex)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    actual = hashlib.pbkdf2_hmac('sha256', password.encode('utf8'), salt, PASSWORD_ITERATIONS)
+    return hmac.compare_digest(actual, expected)
+
+
+def ensure_csrf_token():
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_hex(32)
+    return session['csrf_token']
 
 
 def login_required(func):
+    @wraps(func)
     def wrapper(*args, **kwargs):
+        if registered_user is None:
+            return redirect(url_for('register'))
         if 'user' not in session:
             return redirect(url_for('login'))
         return func(*args, **kwargs)
-    wrapper.__name__ = func.__name__
     return wrapper
 
-# Instantiate the Blockchain
-blockchain = Blockchain()
+
+def csrf_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        submitted_token = request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
+        session_token = session.get('csrf_token')
+        if not session_token or not submitted_token or not hmac.compare_digest(session_token, submitted_token):
+            return jsonify({'message': 'Invalid CSRF token'}), 403
+        return func(*args, **kwargs)
+    return wrapper
 
 
 @app.route('/')
+@login_required
 def index():
-    if not registered_user:
-        return redirect(url_for('register'))
-    return render_template('index.html')
+    return render_template('index.html', csrf_token=ensure_csrf_token())
 
 
 @app.route('/configure')
+@login_required
 def configure():
-    return render_template('./configure.html')
+    return render_template('./configure.html', csrf_token=ensure_csrf_token())
 
 
 @app.route('/transactions/new', methods=['POST'])
@@ -635,7 +862,8 @@ def new_transaction():
 @app.route('/transactions/get', methods=['GET'])
 def get_transactions():
     # Get transactions from transactions pool
-    transactions = blockchain.transactions
+    with blockchain._lock:
+        transactions = copy.deepcopy(blockchain.transactions)
 
     response = {'transactions': transactions}
     return jsonify(response), 200
@@ -662,37 +890,23 @@ def receive_transaction():
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
+    with blockchain._lock:
+        chain = copy.deepcopy(blockchain.chain)
     response = {
-        'chain': blockchain.chain,
-        'length': len(blockchain.chain),
+        'chain': chain,
+        'length': len(chain),
     }
     return jsonify(response), 200
 
 
-@app.route('/mine', methods=['GET'])
+@app.route('/mine', methods=['POST'])
+@login_required
+@csrf_required
 def mine():
-    if blockchain.public_key_from_address(blockchain.node_address) is None:
-        response = {'message': 'Please register a valid Denarius miner address before mining'}
-        return jsonify(response), 400
-
-    # We run the proof of work algorithm to get the next proof...
-    last_block = blockchain.chain[-1]
-    nonce = blockchain.proof_of_work()
-
-    # We must receive a reward for finding the proof.
-    blockchain.transactions.append(blockchain.create_coinbase_transaction())
-
-    # Forge the new Block by adding it to the chain
-    previous_hash = blockchain.hash(last_block)
-    block = blockchain.create_block(nonce, previous_hash)
+    block = blockchain.mine_pending_transactions()
     if block is False:
-        response = {'message': 'Block has too many transactions'}
+        response = {'message': 'Unable to mine: configure a valid miner or retry after the chain changes'}
         return jsonify(response), 406
-
-    blockchain.broadcast_block(block)
-
-    # save this state
-    blockchain.save_everything()
 
     response = {
         'message': "New Block Forged",
@@ -720,6 +934,8 @@ def receive_block():
 
 
 @app.route('/miner/register', methods=['POST'])
+@login_required
+@csrf_required
 def register_miner():
     values = request.form
     address = values.get('address')
@@ -730,8 +946,10 @@ def register_miner():
 
     try:
         blockchain.set_miner_info(name, address)
-    except ValueError:
-        return "Error: Please add a valid Denarius address", 400
+    except ValueError as exc:
+        return jsonify({'message': str(exc)}), 400
+
+    blockchain.save_everything()
 
     response = {
         'message': 'Miner information has been updated',
@@ -741,6 +959,8 @@ def register_miner():
 
 
 @app.route('/nodes/register', methods=['POST'])
+@login_required
+@csrf_required
 def register_nodes():
     values = request.form
     submitted_nodes = values.get('nodes')
@@ -750,11 +970,15 @@ def register_nodes():
 
     nodes = submitted_nodes.replace(" ", "").split(',')
 
-    for node in nodes:
-        if node:
-            blockchain.register_node(node)
+    try:
+        for node in nodes:
+            if node:
+                blockchain.register_node(node)
+    except ValueError as exc:
+        return jsonify({'message': str(exc)}), 400
 
     blockchain.exchange_peer_table()
+    blockchain.save_everything()
 
     response = {
         'message': 'New nodes have been added',
@@ -763,7 +987,9 @@ def register_nodes():
     return jsonify(response), 201
 
 
-@app.route('/nodes/resolve', methods=['GET'])
+@app.route('/nodes/resolve', methods=['POST'])
+@login_required
+@csrf_required
 def consensus():
     replaced = blockchain.resolve_conflicts()
 
@@ -782,16 +1008,20 @@ def consensus():
 
 @app.route('/nodes/get', methods=['GET'])
 def get_nodes():
-    nodes = list(blockchain.nodes)
+    with blockchain._lock:
+        nodes = sorted(blockchain.nodes)
     response = {'nodes': nodes}
     return jsonify(response), 200
 
 
 @app.route('/miner/get', methods=['GET'])
 def get_miner_info():
-    response = {'name': blockchain.miner_name,
-                'address': blockchain.node_address,
-                'balance': blockchain.get_balance(blockchain.node_address)
+    with blockchain._lock:
+        miner_name = blockchain.miner_name
+        miner_address = blockchain.node_address
+    response = {'name': miner_name,
+                'address': miner_address,
+                'balance': blockchain.get_balance(miner_address)
                 }
     return jsonify(response), 200
 
@@ -802,26 +1032,39 @@ def get_miner_info():
 def register():
     global registered_user
     if registered_user:
-        return redirect(url_for('index'))
+        return redirect(url_for('login'))
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        registered_user = {'username': username, 'password': password}
+        submitted_token = request.form.get('csrf_token')
+        if not submitted_token or not hmac.compare_digest(ensure_csrf_token(), submitted_token):
+            return 'Invalid CSRF token', 403
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        if not username or len(username) > 64 or len(password) < 10:
+            return 'Username is required and password must be at least 10 characters', 400
+        registered_user = {'username': username, 'password_hash': hash_password(password)}
+        session.clear()
         session['user'] = username
+        ensure_csrf_token()
         return redirect(url_for('index'))
-    return render_template('register.html')
+    return render_template('register.html', csrf_token=ensure_csrf_token())
 
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if registered_user and username == registered_user['username'] and password == registered_user['password']:
+        submitted_token = request.form.get('csrf_token')
+        if not submitted_token or not hmac.compare_digest(ensure_csrf_token(), submitted_token):
+            return 'Invalid CSRF token', 403
+        username = request.form.get('username', '')
+        password = request.form.get('password', '')
+        if (registered_user and username == registered_user['username']
+                and verify_password(password, registered_user['password_hash'])):
+            session.clear()
             session['user'] = username
+            ensure_csrf_token()
             return redirect(url_for('index'))
         return 'Invalid credentials', 403
-    return render_template('login.html')
+    return render_template('login.html', csrf_token=ensure_csrf_token())
 
 
 @app.route('/logout')
@@ -843,10 +1086,9 @@ if __name__ == '__main__':
 
     # resume to the state
     if path:
-        blockchain = blockchain.load_everything(path)
+        try:
+            blockchain = blockchain.load_everything(path)
+        except ValueError as exc:
+            parser.error(str(exc))
 
-    # Run with SSL support
-    #app.run(host='127.0.0.1', port=port, ssl_context=("../certificates/cert.pem", "../certificates/key.pem"))
-
-    # Run without SSL support
     app.run(host='127.0.0.1', port=port)

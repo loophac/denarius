@@ -104,6 +104,8 @@
     <script>
       $(function(){
 
+        var csrfToken = {{ csrf_token|tojson }};
+
         function formatDenarii(atomicValue) {
           var atomic = BigInt(atomicValue);
           var units = 100000000n;
@@ -204,7 +206,8 @@
 
           $.ajax({
             url: "/mine",
-            type: "GET",
+            type: "POST",
+            headers: {"X-CSRF-Token": csrfToken},
             success: function(response){
 
               window.location.reload();
@@ -229,7 +232,8 @@
 
           $.ajax({
             url: "/nodes/resolve",
-            type: "GET",
+            type: "POST",
+            headers: {"X-CSRF-Token": csrfToken},
             success: function(response){
 
               window.location.reload();
